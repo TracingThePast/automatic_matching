@@ -1,0 +1,9 @@
+LICENSE
+setup.py
+automatic_matching/__init__.py
+automatic_matching/automatic_matching.py
+automatic_matching.egg-info/PKG-INFO
+automatic_matching.egg-info/SOURCES.txt
+automatic_matching.egg-info/dependency_links.txt
+automatic_matching.egg-info/requires.txt
+automatic_matching.egg-info/top_level.txt

@@ -1,0 +1,2 @@
+levenshtein~=0.25
+numpy~=1.26
