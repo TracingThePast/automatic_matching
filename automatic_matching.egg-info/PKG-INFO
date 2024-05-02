@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: automatic_matching
-Version: 0.1.0
+Version: 0.1.1
 Summary: An automatic matching algorithm that allows to link references to the same person in multiple independent databases, based on a list of search criteria.
 Home-page: https://github.com/TracingThePast/automatic_matching
 Author: Jan Bernrader

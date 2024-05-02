@@ -1,1 +1,1 @@
-from automatic_matching import *
+from .automatic_matching_functions import *
