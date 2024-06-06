@@ -80,6 +80,15 @@ def get_names_as_list(names, is_surname=False, remove_acronyms=True):
             })
     return result
 
+
+def get_names_as_list_flattend(values, is_surname = False):
+    result = []
+    list_values = get_names_as_list(values, is_surname)
+    for val in list_values:
+        result.append(val['original'])
+        result.append(val['normalized'])
+    return ', '.join(result)
+
 def match_against_local_data(local_data, external_data):
     '''
         Takes two lists of local and external values and compares them.
@@ -125,7 +134,7 @@ BIRTH_DATE_MAX_SCORE_CONTRIBUTION = 15
 DEATH_PLACE_MAX_SCORE_CONTRIBUTION = 10
 DEATH_DATE_MAX_SCORE_CONTRIBUTION = 10
 
-MIN_REQUIRED_SCORE_FOR_AUTO_MATCHING = 66
+MIN_REQUIRED_SCORE_FOR_AUTO_MATCHING = 60
 
 TOTAL_MAX_SCORE_REACHABLE = FORENAME_MAX_SCORE_CONTRIBUTION + SURNAME_MAX_SCORE_CONTRIBUTION + BIRTH_PLACE_MAX_SCORE_CONTRIBUTION + BIRTH_DATE_MAX_SCORE_CONTRIBUTION + DEATH_PLACE_MAX_SCORE_CONTRIBUTION + DEATH_DATE_MAX_SCORE_CONTRIBUTION
 
@@ -225,7 +234,7 @@ def get_matching_score(local_data_set, external_data_set):
             if death_place_results['matched_pairs'][0]['levenshtein_distance_normalized'] == 0:
                 death_place_score = DEATH_PLACE_MAX_SCORE_CONTRIBUTION
             else:
-                death_place_score = DEATH_PLACE_MAX_SCORE_CONTRIBUTION * ( 1 / ( 1 + death_place_results['mean_levenshtein_distance']**4 * 0.05))
+                death_place_score = DEATH_PLACE_MAX_SCORE_CONTRIBUTION * ( 1 / ( 1 + death_place_results['mean_levenshtein_distance_normalized']**4 * 0.05))
             death_place_score_original = DEATH_PLACE_MAX_SCORE_CONTRIBUTION * ( 1 / ( 1 + death_place_results['mean_levenshtein_distance_original']**4 * 0.05))
             results['death_place'] = death_place_results
             results['death_place']['score'] = death_place_score
