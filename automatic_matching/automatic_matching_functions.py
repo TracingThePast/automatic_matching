@@ -128,8 +128,8 @@ def match_against_local_data(local_data, external_data):
 FORENAME_MAX_SCORE_CONTRIBUTION = 25
 SURNAME_MAX_SCORE_CONTRIBUTION = 25
 
-BIRTH_PLACE_MAX_SCORE_CONTRIBUTION = 15
-BIRTH_DATE_MAX_SCORE_CONTRIBUTION = 15
+BIRTH_PLACE_MAX_SCORE_CONTRIBUTION = 10
+BIRTH_DATE_MAX_SCORE_CONTRIBUTION = 20
 
 DEATH_PLACE_MAX_SCORE_CONTRIBUTION = 10
 DEATH_DATE_MAX_SCORE_CONTRIBUTION = 10
@@ -214,12 +214,22 @@ def get_matching_score(local_data_set, external_data_set):
         if len(local_data_set['birth_date']) == 10 and len(external_data_set['birth_date']) == 10:
             birth_date_levenshtein_distance = levenshtein_distance(local_data_set['birth_date'], external_data_set['birth_date'])
             birth_date_score = BIRTH_DATE_MAX_SCORE_CONTRIBUTION * ( 1 / ( 1 + birth_date_levenshtein_distance**2) ) 
+            # Added a penalty for massive deviations in the year
+
             results['birth_date'] = {
                 'levenshtein_distance': birth_date_levenshtein_distance,
                 'local': local_data_set['birth_date'],
                 'external': external_data_set['birth_date'],
-                'score': birth_date_score
+                'score_wo_penalty': birth_date_score
             }
+            try:
+                external_data_year = int(external_data_set['birth_date'].split('.')[-1])
+                local_data_year = int(local_data_set['birth_date'].split('.')[-1])
+                difference = abs(external_data_year - local_data_year)
+                birth_date_score -= difference
+            except:
+                    birth_date_score = - 0.25 * BIRTH_DATE_MAX_SCORE_CONTRIBUTION
+            results['birth_date']['score'] = birth_date_score
             max_score_reachable += BIRTH_DATE_MAX_SCORE_CONTRIBUTION
             absolute_score += birth_date_score
             absolute_score_original += birth_date_score
