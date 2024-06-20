@@ -303,7 +303,7 @@ def get_matching_score(local_data_set, external_data_set):
         external_birth_place = get_names_as_list(external_data_set['birth_place'])
         if len(local_birth_place) > 0 and len(external_birth_place) > 0:
             birth_place_results = match_against_local_data(local_birth_place, external_birth_place)
-            if birth_place_results['matched_pairs'][0]['levenshtein_ratio_normalized'] == 0:
+            if birth_place_results['matched_pairs'][0]['levenshtein_ratio_normalized'] == 1:
                 # For places if we get a perfect match on one of the entries we accept the entire matched string as a perfect match
                 # Background often Place of Birth / Death might be formated differently e.g. localy: München / Bayern | externaly: München - Freistaat Bayern
                 # even though this is obviously a match the score would be relatively small due tue the different formating
@@ -341,7 +341,7 @@ def get_matching_score(local_data_set, external_data_set):
         external_death_place = get_names_as_list(external_data_set['death_place'])
         if len(local_death_place) > 0 and len(external_death_place) > 0:
             death_place_results = match_against_local_data(local_death_place, external_death_place)
-            if death_place_results['matched_pairs'][0]['levenshtein_ratio_normalized'] == 0:
+            if death_place_results['matched_pairs'][0]['levenshtein_ratio_normalized'] == 1:
                 death_place_score = DEATH_PLACE_MAX_SCORE_CONTRIBUTION
             else:
                 death_place_score = DEATH_PLACE_MAX_SCORE_CONTRIBUTION * death_place_results['mean_levenshtein_ratio_normalized']
