@@ -137,11 +137,20 @@ def match_against_local_data(local_data, external_data):
     levenshtein_ratios_orginal = []
 
     for smaller_name_normalized in names_in_smaller_set_normalized:
-        tmp_val = np.max(names_in_smaller_set_normalized[smaller_name_normalized]) if len(names_in_smaller_set_normalized[smaller_name_normalized]) > 0 else 0
+        tmp_val = 0
+        if len(names_in_smaller_set_normalized[smaller_name_normalized]) > 0:
+            tmp_val = np.mean(names_in_smaller_set_normalized[smaller_name_normalized])**2
+            if max(names_in_smaller_set_normalized[smaller_name_normalized]) == 1:
+                tmp_val = 1
         levenshtein_ratios_normalized.append(tmp_val)
     for smaller_name_original in names_in_smaller_set_original:
-        tmp_val = np.max(names_in_smaller_set_original[smaller_name_original]) if len(names_in_smaller_set_original[smaller_name_original]) > 0 else 0
+        tmp_val = 0
+        if len(names_in_smaller_set_original[smaller_name_original]) > 0:
+            tmp_val = np.mean(names_in_smaller_set_original[smaller_name_original])**2
+            if max(names_in_smaller_set_normalized[smaller_name_normalized]) == 1:
+                tmp_val = 1
         levenshtein_ratios_orginal.append(tmp_val)
+        
 
 
     matched_pairs_sorted = sorted(matched_pairs, key=lambda x: -x['levenshtein_ratio_normalized'])
