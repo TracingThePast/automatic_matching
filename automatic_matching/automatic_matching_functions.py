@@ -167,52 +167,92 @@ def match_against_local_data(local_data, external_data):
         'score': (mean_levenshtein_ratio_normalized + median_levenshtein_ratio_normalized) / 2
     }
 
-def match_date_against_local_date(local_date, external_date):
+def number_normalization_for_common_ocr_mistakes(value):
+    return value.replace("7", "1")
+
+def match_date_against_local_date(local_date, external_date, use_normalization=True):
     match_score = 0
     date_levenshtein_distance = levenshtein_distance(local_date, external_date)
     best_match_found = local_date
+    applied_ocr_normalization_day_month = False
+    applied_ocr_normalization_year = False
+    normalization_contribution = 0
     day_month_switched = False
     if date_levenshtein_distance > 0:
-        try: 
+        try:
             local_day, local_month, local_year = local_date.split('.')
             external_day, external_month, external_year = external_date.split('.')
             # first check for switched month and day
             day_month_switched_levenshtein_distance = -1
             day_month_levenshtein_distance = levenshtein_distance(f'{local_day}.{local_month}', f'{external_day}.{external_month}')
+            if day_month_levenshtein_distance > 0 and use_normalization:
+                day_month_levenshtein_distance_normalized = levenshtein_distance(number_normalization_for_common_ocr_mistakes(f'{local_day}.{local_month}'), number_normalization_for_common_ocr_mistakes(f'{external_day}.{external_month}'))
+                if day_month_levenshtein_distance_normalized == 0:
+                    applied_ocr_normalization_day_month = True
+                    normalization_contribution = 0.1
+                    day_month_levenshtein_distance = 0
             if day_month_levenshtein_distance > 0:
                 if max([int(external_month), int(external_day), int(local_month), int(local_day)]) < 13:
                     day_month_switched_levenshtein_distance = levenshtein_distance(f'{local_day}.{local_month}', f'{external_month}.{external_day}')
                     if day_month_switched_levenshtein_distance == 0:
                         day_month_switched = True
+                    elif use_normalization:
+                        day_month_switched_levenshtein_distance_normalized = levenshtein_distance(number_normalization_for_common_ocr_mistakes(f'{local_day}.{local_month}'), number_normalization_for_common_ocr_mistakes(f'{external_month}.{external_day}'))
+                        if day_month_switched_levenshtein_distance_normalized == 0:
+                            applied_ocr_normalization_day_month = True
+                            day_month_switched = True
+                            normalization_contribution = 0.1
+                            day_month_levenshtein_distance = 0
 
             year_levenshtein_distance = levenshtein_distance(local_year, external_year)
             if year_levenshtein_distance == 0:
                 # The years match
                 if day_month_switched_levenshtein_distance == 0:
-                    match_score = ( 1 + 0.85 ) / 2
+                    match_score = ( 1 + 0.85 - normalization_contribution) / 2
                 else:
-                    match_score = ( 1 + 0.85 / ( 1 + day_month_levenshtein_distance**2) ) / 2
+                    match_score = ( 1 + (0.85 - normalization_contribution) / ( 1 + day_month_levenshtein_distance**2 ) ) / 2
             else:
-                # Two numbers in date have been edited
-                # The last two digits in the year might have been switched
-                year_switched_last_levenshtein_distance = levenshtein_distance(local_year, f'{external_year[0]}{external_year[1]}{external_year[3]}{external_year[2]}')
-                year_contribution = 0.75
-                year_distance = abs(int(local_year) - int(external_year))
-                if year_switched_last_levenshtein_distance == 0:
-                    year_contribution = 0.90
-                else:
-                    year_contribution = 0.75 - year_distance / 10
-                if year_contribution <= 0:
-                    match_score = 0
-                else:
-                    if day_month_levenshtein_distance == 0:
-                        # Only the years have altercations or misspellings
-                        match_score = ( year_contribution + 1 ) / 2
-                    elif day_month_switched_levenshtein_distance == 1:
-                        # The years have altercations or misspellings and date and month have been switched
-                        match_score = ( year_contribution + 0.85 ) / 2
+                if use_normalization:
+                    # Initial mismatch might be due to ocr mistake
+                    year_levenshtein_distance_normalized = levenshtein_distance(number_normalization_for_common_ocr_mistakes(local_year), number_normalization_for_common_ocr_mistakes(external_year))
+                    if year_levenshtein_distance_normalized == 0:
+                        year_levenshtein_distance = 0
+                        normalization_contribution += 0.1
+                        applied_ocr_normalization_year = True
+                        if day_month_switched_levenshtein_distance == 0:
+                            match_score = ( 1 + 0.85 - normalization_contribution) / 2
+                        else:
+                            match_score = ( 1 + (0.85 - normalization_contribution) / ( 1 + day_month_levenshtein_distance**2 ) ) / 2
+                    
+                if year_levenshtein_distance > 0:
+
+                    # Two numbers in date have been edited
+                    # The last two digits in the year might have been switched
+                    year_switched_last_levenshtein_distance = levenshtein_distance(local_year, f'{external_year[0]}{external_year[1]}{external_year[3]}{external_year[2]}')
+                    if use_normalization:
+                        year_switched_last_levenshtein_distance_normalized = levenshtein_distance(number_normalization_for_common_ocr_mistakes(local_year), number_normalization_for_common_ocr_mistakes(f'{external_year[0]}{external_year[1]}{external_year[3]}{external_year[2]}'))
+                        if year_switched_last_levenshtein_distance_normalized == 0:
+                            year_switched_last_levenshtein_distance = 0
+                            applied_ocr_normalization_year = True
+                            normalization_contribution += 0.1
+
+                    year_contribution = 0.75
+                    if year_switched_last_levenshtein_distance == 0:
+                        year_contribution = 0.90
                     else:
-                        match_score = ( year_contribution + 0.85 / ( 1 + day_month_levenshtein_distance**2) ) / 2
+                        year_distance = abs(int(local_year) - int(external_year))
+                        year_contribution = 0.75 - year_distance / 10
+                    if year_contribution <= 0:
+                        match_score = 0
+                    else:
+                        if day_month_levenshtein_distance == 0:
+                            # Only the years have altercations or misspellings
+                            match_score = ( year_contribution + 1 - normalization_contribution ) / 2
+                        elif day_month_switched_levenshtein_distance == 1:
+                            # The years have altercations or misspellings and date and month have been switched
+                            match_score = ( year_contribution + 0.85 - normalization_contribution ) / 2
+                        else:
+                            match_score = ( year_contribution + 0.85 - normalization_contribution / ( 1 + day_month_levenshtein_distance**2) ) / 2
 
         except:
             match_score = 0
@@ -222,7 +262,9 @@ def match_date_against_local_date(local_date, external_date):
     return {
         'levenshtein_distance': date_levenshtein_distance,
         'score': match_score,
-        'day_month_switched': day_month_switched
+        'day_month_switched': day_month_switched,
+        'applied_ocr_normalization_day_month': applied_ocr_normalization_day_month,
+        'applied_ocr_normalization_year': applied_ocr_normalization_year,
     }
 
 
