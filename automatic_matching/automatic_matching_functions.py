@@ -1,8 +1,18 @@
 import icu
 import re
 import numpy as np
+from difflib import *
+import datetime
+from dateutil.relativedelta import relativedelta
+
 from Levenshtein import distance as levenshtein_distance
 from Levenshtein import ratio as levenshtein_ratio
+from pyxdameraulevenshtein import damerau_levenshtein_distance, normalized_damerau_levenshtein_distance, damerau_levenshtein_distance_seqs
+from rapidfuzz import fuzz
+from doublemetaphone import doublemetaphone
+
+AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.0"
+
 
 latin_transliterator = icu.Transliterator.createInstance('Any-Latin; Latin-ASCII;IPA-XSampa;NFD; [:Nonspacing Mark:] Remove; NFC; Lower();')
 # Creates a transliterator that replaces all non latin characters, removes all accents and lowercases the entire string.
@@ -47,6 +57,316 @@ def test_transliteration():
             matches += 1
     print(f'Found {matches} matches of ({len(replacements)})')
 
+
+def number_normalization_for_common_ocr_mistakes(value):
+    return value.replace("7", "1")
+
+month_day_weights = np.array([
+    0,
+    0.5,
+    0.75,
+    0,
+    0,
+])
+
+year_weights = np.array([
+    0,
+    0.5,
+])
+
+def get_date_sequences(date):
+    normalized_year = number_normalization_for_common_ocr_mistakes(date['year'])
+    if abs(int(normalized_year) - int(date['year'])) > 10:
+        # with such wide discrepancies we'd hope the error should have been caught. Otherwise a match between 1971 & 1911 would be possible 
+        normalized_year = date['year']
+        
+    normalized_month = number_normalization_for_common_ocr_mistakes(date['month'])
+    normalized_day = number_normalization_for_common_ocr_mistakes(date['day'])
+    
+    month_day_sequences = [
+        f"{date['month']}-{date['day']}", # x
+        f"{date['day']}-{date['month']}", # 0.5 + 4 * x
+        f"{normalized_month}-{normalized_day}", # 0.75 + 4 * x,
+        f"{date['month']}-**", # 4 * x
+        "**-**", # 4 * x
+    ]
+    year_sequences = [
+        date['year'], # x
+        date['year'][:2] + date['year'][3] + date['year'][2] # 0.5 + 2 * x
+    ]
+
+    return {
+        'month_day_sequences': month_day_sequences,
+        'year_sequences': year_sequences,
+    }
+
+def convert_dates(dates):
+    thresholds = {}
+    dates_list = []
+    for date_string in dates:
+        date_split = date_string.split('-')
+        if len(date_split) != 3:
+            continue
+        if len(date_split[0]) != 4 or len(date_split[1]) != 2 or len(date_split[2]) != 2:
+            continue
+        date = {
+            'year': date_split[0],
+            'month': date_split[1],
+            'day': date_split[2]
+        }
+
+        month = date_split[1]
+        day = date_split[2]
+        
+        
+        timedelta_kwargs = {}
+
+
+        if not month.isdigit():
+            month = "01"
+            timedelta_kwargs['years'] = 1
+        elif len(month) == 1:
+            date['month'] = '0' + date['month']
+        if not day.isdigit():
+            day = "01"
+            if 'years' not in timedelta_kwargs:
+                timedelta_kwargs['months'] = 1
+        else:
+            if len(day) == 1:
+                date['day'] = '0' + date['day']
+            timedelta_kwargs['hours'] = 23
+            timedelta_kwargs['minutes'] = 59
+        if date['year'][0] == ">":
+            date['year'] = date['year'][1:]
+            if date['year'].isdigit():
+                try:
+                    threshold = datetime.datetime(int(date['year']), int(month), int(day), 0)
+                    if 'min' not in thresholds or threshold < thresholds['min']:
+                        thresholds['min'] = threshold
+                except:
+                    pass
+        elif date['year'][0] == "<":
+            date['year'] = date['year'][1:]
+            if date['year'].isdigit():
+                try:
+                    threshold = datetime.datetime(int(date['year']), int(month), int(day), 0) + relativedelta(**timedelta_kwargs)
+                    if 'max' not in thresholds or threshold > thresholds['max']:
+                        thresholds['max'] = threshold
+                except:
+                    pass
+        elif date['year'].isdigit():
+            # String comparisons are only applied to dates that aren't preceded by < or >
+            daterange = {}
+            try:
+                date_from = datetime.datetime(int(date['year']), int(month), int(day), 0)
+                date_to = date_from + relativedelta(**timedelta_kwargs)
+                daterange = {
+                    'datetime_from': date_from,
+                    'datetime_to': date_to
+                }
+                #if 'min' not in date_range or date_from < date_range['min']:
+                #    date_range['min'] = date_from
+                #if 'max' not in date_range or date_to > date_range['max']:
+                #    date_range['max'] = date_to
+            except:
+                pass
+                  
+            dates_list.append({
+                'date': date,
+                **get_date_sequences(date),
+                **daterange
+            })
+
+    return {
+        'thresholds': thresholds,
+        'dates': dates_list,
+        #'range': date_range
+    }
+
+def daterange_as_string(threshold_min=None, threshold_max=None):
+    if threshold_min != None and threshold_max != None:
+        return f"{threshold_min:%Y-%m-%d} <= X <= {threshold_max:%Y-%m-%d}"
+    if threshold_min != None:
+        return f"{threshold_min:%Y-%m-%d} <= X"
+    if threshold_max != None:
+        return f"X <= {threshold_max:%Y-%m-%d}"
+    return ' - '
+
+def datetime_range_matches_date(thresholds, dates, external_range=False):
+
+    range_label = 'local'
+    date_label = 'external'
+    if external_range:
+        range_label = 'external'
+        date_label = 'local'
+
+    threshold_min = thresholds.get('min', None)
+    threshold_max = thresholds.get('max', None)
+    matches = []
+    non_matches = []
+    if threshold_min and threshold_max:
+        # Specified date range:                      |===============|
+        # Possible scenarios:            |===============| ✓
+        #                                                       |======| ✓
+        #                                                       | ✓
+        #                                              |===========| ✓
+        #                                                               |==============| x
+        for date in dates:
+            if 'datetime_from' not in date:
+                continue
+            if threshold_min <= date['datetime_to'] and threshold_max >= date['datetime_from']:
+                matches.append({
+                    range_label: daterange_as_string(threshold_min, threshold_max),
+                    date_label: f"{date['year_sequences'][0]}-{date['month_day_sequences'][0]}"
+                })
+            else:
+                matches.append({
+                    range_label: daterange_as_string(threshold_min, threshold_max),
+                    date_label: f"! {date['year_sequences'][0]}-{date['month_day_sequences'][0]}"
+                })
+                
+    elif threshold_min:
+        # Specified date range:                                       | =>
+        # Possible scenarios:                    |===============| x
+        #                                                         |======| ✓
+        #                                                                 | ✓
+        #                                                  |===========| ✓
+        #                                                               |==============| ✓
+        for date in dates:
+            if 'datetime_from' not in date:
+                continue
+            if threshold_min <= date['datetime_to'] or threshold_min <= date['datetime_from']:
+                matches.append({
+                    range_label: daterange_as_string(threshold_min, None),
+                    date_label: f"{date['year_sequences'][0]}-{date['month_day_sequences'][0]}"
+                })
+            else:
+                non_matches.append({
+                    range_label: daterange_as_string(threshold_min, None),
+                    date_label: f"! {date['year_sequences'][0]}-{date['month_day_sequences'][0]}"
+                })
+                
+    elif threshold_max:
+        # Specified date range:                                  => | 
+        # Possible scenarios:                    |===============| ✓
+        #                                                         |======| ✓
+        #                                                                 | ✓
+        #                                                  |===========| ✓
+        #                                                               |==============| x
+        for date in dates:
+            if 'datetime_from' not in date:
+                continue
+            if threshold_max >= date['datetime_to'] or threshold_max >= date['datetime_from']:
+                matches.append({
+                    range_label: daterange_as_string(None, threshold_max),
+                    date_label: f"{date['year_sequences'][0]}-{date['month_day_sequences'][0]}"
+                })
+            else:
+                non_matches.append({
+                    range_label: daterange_as_string(None, threshold_max),
+                    date_label: f"! {date['year_sequences'][0]}-{date['month_day_sequences'][0]}"
+                })
+                
+            
+    return matches, non_matches
+
+def match_date_against_local_date(local_dates, external_dates):
+    scores = []
+    result = {}
+    converted_local_dates = convert_dates(local_dates)
+    converted_external_dates = convert_dates(external_dates)
+
+    converted_local_dates_thresholds_len = len(converted_local_dates['thresholds'])
+    converted_external_dates_thresholds_len = len(converted_external_dates['thresholds'])
+
+    matched_date_ranges = []
+    non_matched_date_ranges = []
+
+    if converted_local_dates_thresholds_len > 0 and converted_external_dates_thresholds_len > 0:
+        converted_local_dates_min = converted_local_dates['thresholds'].get('min', None)
+        converted_local_dates_max = converted_local_dates['thresholds'].get('max', None)
+        converted_external_dates_min = converted_external_dates['thresholds'].get('min', None)
+        converted_external_dates_max = converted_external_dates['thresholds'].get('max', None)
+
+        if converted_local_dates_min and converted_external_dates_max:
+            if converted_local_dates_min > converted_external_dates_max:
+                non_matched_date_ranges.append({
+                    'local': '!> ' + daterange_as_string(converted_local_dates_min, converted_local_dates_max),
+                    'external': '! ' + daterange_as_string(converted_external_dates_min, converted_external_dates_max),
+                })
+
+        if converted_local_dates_max and converted_external_dates_min:
+            if converted_local_dates_max < converted_external_dates_min:
+                non_matched_date_ranges.append({
+                    'local': '! ' + daterange_as_string(converted_local_dates_min, converted_local_dates_max),
+                    'external': '!> ' + daterange_as_string(converted_external_dates_min, converted_external_dates_max),
+                })
+        
+        if len(non_matched_date_ranges) == 0:
+            matched_date_ranges.append({
+                'local': daterange_as_string(converted_local_dates_min, converted_local_dates_max),
+                'external': daterange_as_string(converted_external_dates_min, converted_external_dates_max),
+            })
+
+    elif converted_local_dates_thresholds_len > 0:
+        matches, non_matches = datetime_range_matches_date(converted_local_dates['thresholds'], converted_external_dates['dates'])
+        matched_date_ranges += matches
+        non_matched_date_ranges += non_matches
+    elif converted_external_dates_thresholds_len > 0:
+        matches, non_matches = datetime_range_matches_date(converted_external_dates['thresholds'], converted_local_dates['dates'])
+        matched_date_ranges += matches
+        non_matched_date_ranges += non_matches
+            
+    if len(matched_date_ranges) > 0:
+        external = ', '.join([x['external'] for x in matched_date_ranges])
+        local = ', '.join([x['local'] for x in matched_date_ranges])
+        result = {
+            'external': external,
+            'local': local,
+            'score': 1
+        }
+    else:
+        for local_date in converted_local_dates['dates']:
+            for external_date in converted_external_dates['dates']:
+                month_day_comparison = np.array(damerau_levenshtein_distance_seqs(external_date['month_day_sequences'][0], local_date['month_day_sequences']))
+                month_day_comparison[1:] *= 4
+                month_day_comparison = month_day_comparison + month_day_weights
+                year_comparison = np.array(damerau_levenshtein_distance_seqs(external_date['year_sequences'][0], local_date['year_sequences']))
+                year_comparison[1:] *= 4
+                year_comparison = year_comparison + year_weights
+                score = np.min(month_day_comparison) + np.min(year_comparison)
+                scores.append({
+                    'external': f"{external_date['year_sequences'][0]}-{external_date['month_day_sequences'][0]}",
+                    'local': f"{local_date['year_sequences'][0]}-{local_date['month_day_sequences'][0]}",
+                    'score': score,
+                })
+    
+        
+        if len(scores) > 0:
+            scores = sorted(scores, key=lambda x: x['score'])
+            result = scores[0]
+            score = min(result['score'], 4) / 4
+            result['score'] = np.cos(score * np.pi)
+
+    if len(result) == 0:
+        if len(non_matched_date_ranges) > 0:
+            external = ', '.join([x['external'] for x in non_matched_date_ranges])
+            local = ', '.join([x['local'] for x in non_matched_date_ranges])
+            result = {
+                'external': external,
+                'local': local,
+                'score': -1
+            }
+        else:
+            result = {
+                'external': "! " + ", ".join(external_dates),
+                'local': "! " + ", ".join(local_dates),
+                'info': 'Could not compare',
+                'score': 0,
+            }
+
+    return result
+
 def normalize_string(value, is_surname = False):
     value = latin_transliterator.transliterate(value)
     if is_surname:
@@ -64,36 +384,84 @@ def normalize_string(value, is_surname = False):
         value = value.replace('tz', 'z')
     return re.sub(r'([a-zA-Z])\1', r'\1', value) # Remove double chararcters
 
-def get_names_as_list(names, is_surname=False, remove_acronyms=True):
-    names_split = names.replace(',', ' ').replace('-', ' ').replace('/', ' ').split(' ')
-    result = []
-    for name in names_split:
+def get_doublemetaphone_matching_score(val_1, val_2, potential_shortform = False):
+    """
+        Returns a range from 0 (perfect match) to 1 (significant differences)
+        the flag potential_shortform indicates that names might be shortened, 
+        This way we are able to consider that e.g. Alex and Alexander are
+        highly likely equivalent as a name.
+    """
+    dm_val_1 = doublemetaphone(val_1)
+    dm_val_2 = doublemetaphone(val_2)
+
+    metaphone_sim = 0
+    min_val_len = min(len(val_1), len(val_2))
+    if min_val_len > 0:
+        min_val_len = min_val_len if min_val_len > 0 else 1
+
+        dm_min_len_1 = max(min(len(dm_val_1[0]), len(dm_val_2[0])), 1)
+        dm_min_len_2 = max(min(len(dm_val_1[1]), len(dm_val_2[1])), 1)
+
+        similarity_1 = max(1 - levenshtein_distance(dm_val_1[0], dm_val_2[0]) / dm_min_len_1, 0)
+        similarity_2 = max(1 - levenshtein_distance(dm_val_1[1], dm_val_2[1]) / dm_min_len_2, 0)
+        
+        dlr = max( 1 - damerau_levenshtein_distance(val_1.lower(), val_2.lower()) / min_val_len, 0)
+        
+        if potential_shortform:
+            dm_matching_blocks_1 = SequenceMatcher(None, dm_val_1[0], dm_val_2[0]).get_matching_blocks()
+            if dm_matching_blocks_1[0][2] == dm_min_len_1 and dm_matching_blocks_1[1][2] == 0:
+                dm_matching_blocks_2 = SequenceMatcher(None, dm_val_1[1], dm_val_2[1]).get_matching_blocks()
+                if dm_matching_blocks_2[0][2] == dm_min_len_2 and dm_matching_blocks_2[1][2] == 0:
+                    if dm_min_len_1 <= 2 or dm_min_len_2 <= 2:
+                        dlr_part = fuzz.partial_ratio(val_1.lower(), val_2.lower())
+                        if dlr_part >= 85:
+                            similarity_1 = 1
+                            similarity_2 = 1 
+                    else:
+                        similarity_1 = 1
+                        similarity_2 = 1
+        metaphone_sim = (similarity_1 + similarity_2) / 2
+        if metaphone_sim < 1:
+            metaphone_sim = (metaphone_sim + dlr) / 2
+        else:
+            metaphone_sim = (3 * metaphone_sim + dlr) / 4
+    
+    return 1 - metaphone_sim
+
+def get_names_as_dict(names, is_surname=False, remove_acronyms=True):
+    result = {}
+    for name in names:
         name_length = len(name)
         if remove_acronyms:
-            if  name_length == 1:
+            if name_length == 1:
                 continue
-            if name_length == 2 and name[-1] == '.':
+            if remove_acronyms and name_length == 2 and name[-1] == '.':
                 continue
         if name_length > 0:
-            result.append({
-                "original": name,
-                "normalized": normalize_string(name, is_surname)
-            })
+            normalized_value = normalize_string(name, is_surname)
+            if normalized_value not in result:
+                result[normalized_value] = []
+            result[normalized_value].append(name)
     return result
+
+def split_string_values(value):
+    val = value.replace('(', '').replace(')', '').replace(':', '')
+    return list(filter(None, re.split('; |, |/ | ', val)))
 
 
 def get_names_as_list_flattend(values, is_surname = False):
     result = []
-    list_values = get_names_as_list(values, is_surname)
-    for val in list_values:
-        result.append(val['original'])
-        result.append(val['normalized'])
+    dict_values = get_names_as_dict(values, is_surname)
+    for val in dict_values:
+        result.append(val)
+        for orig_val in dict_values[val]:
+            result.append(orig_val)
     return ', '.join(result)
 
-def match_against_local_data(local_data, external_data):
+def match_against_local_data(local_data, external_data, potential_shortform = False):
     '''
         Takes two lists of local and external values and compares them.
-        Returns the mean value of all minimal Levenshtein ratio and a ordered list all matched pairs.
+        Returns a value between -1 (no match) and 1 (perfect match), following a cosine function.
     '''
     matched_pairs = []
     larger_data_set = external_data
@@ -106,172 +474,197 @@ def match_against_local_data(local_data, external_data):
         smaller_data_set = external_data
         smaller_data_set_label = 'external'
 
+    names_in_larger_set_normalized = {}
+    names_in_larger_set_original = {}
     names_in_smaller_set_normalized = {}
     names_in_smaller_set_original = {}
+    for larger in larger_data_set:
+        names_in_larger_set_normalized[larger] = []
+        for key in larger_data_set[larger]:
+            names_in_larger_set_original[key] = []
     for smaller in smaller_data_set:
-        names_in_smaller_set_normalized[smaller['normalized']] = []
-        names_in_smaller_set_original[smaller['original']] = []
-
-    for smaller in smaller_data_set:
-        temp_levenshtein_ratio_normalized = []
-        temp_levenshtein_ratio_original = []
-        for larger in larger_data_set:
-            lvs_ratio_normalized = levenshtein_ratio(smaller['normalized'], larger['normalized'])
-            temp_levenshtein_ratio_normalized.append(lvs_ratio_normalized)
-            lvs_ratio_original = levenshtein_ratio(smaller['original'], larger['original'])
-            temp_levenshtein_ratio_original.append(lvs_ratio_original)
-            matched_pairs.append({
-                'levenshtein_ratio_normalized': lvs_ratio_normalized,
-                'levenshtein_ratio_original': lvs_ratio_original,
-                larger_data_set_label: larger,
-                smaller_data_set_label: smaller
-            })
-            if lvs_ratio_normalized == 1:
-                # A perfect fit has been found, no further matching is necessary
-                break
-        # As some of the names might occur more than once especially after normalization
-        names_in_smaller_set_normalized[smaller['normalized']].append(max(temp_levenshtein_ratio_normalized))
-        names_in_smaller_set_original[smaller['original']].append(max(temp_levenshtein_ratio_original))
-        
-    levenshtein_ratios_normalized = []
-    levenshtein_ratios_orginal = []
-
-    for smaller_name_normalized in names_in_smaller_set_normalized:
-        tmp_val = 0
-        if len(names_in_smaller_set_normalized[smaller_name_normalized]) > 0:
-            tmp_val = np.mean(names_in_smaller_set_normalized[smaller_name_normalized])**2
-            if max(names_in_smaller_set_normalized[smaller_name_normalized]) == 1:
-                tmp_val = 1
-        levenshtein_ratios_normalized.append(tmp_val)
-    for smaller_name_original in names_in_smaller_set_original:
-        tmp_val = 0
-        if len(names_in_smaller_set_original[smaller_name_original]) > 0:
-            tmp_val = np.mean(names_in_smaller_set_original[smaller_name_original])**2
-            if max(names_in_smaller_set_normalized[smaller_name_normalized]) == 1:
-                tmp_val = 1
-        levenshtein_ratios_orginal.append(tmp_val)
+        names_in_smaller_set_normalized[smaller] = []
+        for key in smaller_data_set[smaller]:
+            names_in_smaller_set_original[key] = []
         
 
 
-    matched_pairs_sorted = sorted(matched_pairs, key=lambda x: -x['levenshtein_ratio_normalized'])
-    mean_levenshtein_ratio_normalized = np.mean(levenshtein_ratios_normalized)
-    median_levenshtein_ratio_normalized = np.median(levenshtein_ratios_normalized)
-    mean_levenshtein_ratio_original = np.mean(levenshtein_ratios_orginal)
-    return {
-        'mean_levenshtein_ratio_normalized': mean_levenshtein_ratio_normalized,
-        'median_levenshtein_ratio_normalized': median_levenshtein_ratio_normalized,
-        'mean_levenshtein_ratio_original': mean_levenshtein_ratio_original,
-        'levenshtein_ratio_normalized': f'Mean: {mean_levenshtein_ratio_normalized}',
-        'levenshtein_ratio_original': f'Mean: {mean_levenshtein_ratio_original}',
-        'matched_pairs': matched_pairs_sorted,
-        'score': (mean_levenshtein_ratio_normalized + median_levenshtein_ratio_normalized) / 2
-    }
+    for larger in larger_data_set:
+        damerau_levenshtein_distance_sequences = damerau_levenshtein_distance_seqs(larger, list(smaller_data_set.keys()))
+        if min(damerau_levenshtein_distance_sequences) == 0:
+            # a perfect match has been found for the normalized names.
+            names_in_larger_set_normalized[larger] = 0
+            if larger in names_in_smaller_set_normalized: # if there is an exact match in the smaller data set we can set this to 0 as well
+                names_in_smaller_set_normalized[larger] = 0
+        else:
+            for smaller in smaller_data_set:
+                normalized_doublemetaphone_matching_score = get_doublemetaphone_matching_score(larger, smaller, potential_shortform)
+                names_in_larger_set_normalized[larger].append(normalized_doublemetaphone_matching_score)
+                if normalized_doublemetaphone_matching_score == 0:
+                    # if for the normalized score a perfect match was found we end our search here
+                    break
+                
+                break_search_in_original = False
+                for larger_original in larger_data_set[larger]:
+                    if break_search_in_original:
+                        break
+                    for smaller_original in names_in_smaller_set_original:
+                        if break_search_in_original:
+                            break
+                        normalized_doublemetaphone_matching_score = get_doublemetaphone_matching_score(larger_original, smaller_original, potential_shortform)
+                        names_in_larger_set_normalized[larger].append(normalized_doublemetaphone_matching_score)
+                        if normalized_doublemetaphone_matching_score == 0:
+                            break_search_in_original = True
 
-def number_normalization_for_common_ocr_mistakes(value):
-    return value.replace("7", "1")
 
-def match_date_against_local_date(local_date, external_date, use_normalization=True):
-    match_score = 0
-    date_levenshtein_distance = levenshtein_distance(local_date, external_date)
-    best_match_found = local_date
-    applied_ocr_normalization_day_month = False
-    applied_ocr_normalization_year = False
-    normalization_contribution = 0
-    day_month_switched = False
-    if date_levenshtein_distance > 0:
-        try:
-            local_day, local_month, local_year = local_date.split('.')
-            external_day, external_month, external_year = external_date.split('.')
-            # first check for switched month and day
-            day_month_switched_levenshtein_distance = -1
-            day_month_levenshtein_distance = levenshtein_distance(f'{local_day}.{local_month}', f'{external_day}.{external_month}')
-            if day_month_levenshtein_distance > 0 and use_normalization:
-                day_month_levenshtein_distance_normalized = levenshtein_distance(number_normalization_for_common_ocr_mistakes(f'{local_day}.{local_month}'), number_normalization_for_common_ocr_mistakes(f'{external_day}.{external_month}'))
-                if day_month_levenshtein_distance_normalized == 0:
-                    applied_ocr_normalization_day_month = True
-                    normalization_contribution = 0.1
-                    day_month_levenshtein_distance = 0
-            if day_month_levenshtein_distance > 0:
-                if max([int(external_month), int(external_day), int(local_month), int(local_day)]) < 13:
-                    day_month_switched_levenshtein_distance = levenshtein_distance(f'{local_day}.{local_month}', f'{external_month}.{external_day}')
-                    if day_month_switched_levenshtein_distance == 0:
-                        day_month_switched = True
-                    elif use_normalization:
-                        day_month_switched_levenshtein_distance_normalized = levenshtein_distance(number_normalization_for_common_ocr_mistakes(f'{local_day}.{local_month}'), number_normalization_for_common_ocr_mistakes(f'{external_month}.{external_day}'))
-                        if day_month_switched_levenshtein_distance_normalized == 0:
-                            applied_ocr_normalization_day_month = True
-                            day_month_switched = True
-                            normalization_contribution = 0.1
-                            day_month_levenshtein_distance = 0
+            
+            names_in_larger_set_normalized[larger] = min(names_in_larger_set_normalized[larger])
 
-            year_levenshtein_distance = levenshtein_distance(local_year, external_year)
-            if year_levenshtein_distance == 0:
-                # The years match
-                if day_month_switched_levenshtein_distance == 0:
-                    match_score = ( 1 + 0.85 - normalization_contribution) / 2
-                else:
-                    match_score = ( 1 + (0.85 - normalization_contribution) / ( 1 + day_month_levenshtein_distance**2 ) ) / 2
-            else:
-                if use_normalization:
-                    # Initial mismatch might be due to ocr mistake
-                    year_levenshtein_distance_normalized = levenshtein_distance(number_normalization_for_common_ocr_mistakes(local_year), number_normalization_for_common_ocr_mistakes(external_year))
-                    if year_levenshtein_distance_normalized == 0:
-                        year_levenshtein_distance = 0
-                        normalization_contribution += 0.1
-                        applied_ocr_normalization_year = True
-                        if day_month_switched_levenshtein_distance == 0:
-                            match_score = ( 1 + 0.85 - normalization_contribution) / 2
-                        else:
-                            match_score = ( 1 + (0.85 - normalization_contribution) / ( 1 + day_month_levenshtein_distance**2 ) ) / 2
-                    
-                if year_levenshtein_distance > 0:
+    
+    for smaller in smaller_data_set:
+        if names_in_smaller_set_normalized[smaller] == 0:
+            # if a perfect match was already found in the previous loop
+            continue
+        damerau_levenshtein_distance_sequences = damerau_levenshtein_distance_seqs(smaller, list(larger_data_set.keys()))
+        if min(damerau_levenshtein_distance_sequences) == 0:
+            # a perfect match has been found for the normalized names.
+            names_in_smaller_set_normalized[smaller] = 0
+        else:
+            for larger in larger_data_set:
+                normalized_doublemetaphone_matching_score = get_doublemetaphone_matching_score(larger, smaller, potential_shortform)
+                names_in_smaller_set_normalized[smaller].append(normalized_doublemetaphone_matching_score)
+                if normalized_doublemetaphone_matching_score == 0:
+                    # if for the normalized score a perfect match was found we end our search here
+                    break
+                
+                break_search_in_original = False
+                for smaller_original in smaller_data_set[smaller]:
+                    if break_search_in_original:
+                        break
+                    for larger_original in names_in_larger_set_original:
+                        if break_search_in_original:
+                            break
+                        normalized_doublemetaphone_matching_score = get_doublemetaphone_matching_score(larger_original, smaller_original, potential_shortform)
+                        names_in_smaller_set_normalized[smaller].append(normalized_doublemetaphone_matching_score)
+                        if normalized_doublemetaphone_matching_score == 0:
+                            break_search_in_original = True
 
-                    # Two numbers in date have been edited
-                    # The last two digits in the year might have been switched
-                    year_switched_last_levenshtein_distance = levenshtein_distance(local_year, f'{external_year[0]}{external_year[1]}{external_year[3]}{external_year[2]}')
-                    if use_normalization:
-                        year_switched_last_levenshtein_distance_normalized = levenshtein_distance(number_normalization_for_common_ocr_mistakes(local_year), number_normalization_for_common_ocr_mistakes(f'{external_year[0]}{external_year[1]}{external_year[3]}{external_year[2]}'))
-                        if year_switched_last_levenshtein_distance_normalized == 0:
-                            year_switched_last_levenshtein_distance = 0
-                            applied_ocr_normalization_year = True
-                            normalization_contribution += 0.1
 
-                    year_contribution = 0.75
-                    if year_switched_last_levenshtein_distance == 0:
-                        year_contribution = 0.90
-                    else:
-                        year_distance = abs(int(local_year) - int(external_year))
-                        year_contribution = 0.75 - year_distance / 10
-                    if year_contribution <= 0:
-                        match_score = 0
-                    else:
-                        if day_month_levenshtein_distance == 0:
-                            # Only the years have altercations or misspellings
-                            match_score = ( year_contribution + 1 - normalization_contribution ) / 2
-                        elif day_month_switched_levenshtein_distance == 1:
-                            # The years have altercations or misspellings and date and month have been switched
-                            match_score = ( year_contribution + 0.85 - normalization_contribution ) / 2
-                        else:
-                            match_score = ( year_contribution + 0.85 - normalization_contribution / ( 1 + day_month_levenshtein_distance**2) ) / 2
+            
+            names_in_smaller_set_normalized[smaller] = min(names_in_smaller_set_normalized[smaller])
+        
+    smaller_data_set_scores = []
+    larger_data_set_scores = []
 
-        except:
-            match_score = 0
-    else:
-        match_score = 1
+    for smaller in names_in_smaller_set_normalized:
+        smaller_data_set_scores.append(names_in_smaller_set_normalized[smaller])
+
+    for larger in names_in_larger_set_normalized:
+        larger_data_set_scores.append(names_in_larger_set_normalized[larger])
+
+    smaller_data_set_scores.sort()
+    larger_data_set_scores.sort()
+
+
+    smaller_data_set_score = np.cos(np.pi * (2 * np.mean(smaller_data_set_scores) + max(smaller_data_set_scores)) / 3)
+    larger_data_set_score = np.cos(np.pi * (2 * np.mean(larger_data_set_scores) + max(larger_data_set_scores)) / 3)
+    score = (smaller_data_set_score + larger_data_set_score ) / 2
+    
 
     return {
-        'levenshtein_distance': date_levenshtein_distance,
-        'score': match_score,
-        'day_month_switched': day_month_switched,
-        'applied_ocr_normalization_day_month': applied_ocr_normalization_day_month,
-        'applied_ocr_normalization_year': applied_ocr_normalization_year,
+        'score': score,
+        'smaller_data_set_score': smaller_data_set_score,
+        'larger_data_set_score': larger_data_set_score,
+        f'{smaller_data_set_label}_score': smaller_data_set_score,
+        f'{larger_data_set_label}_score': larger_data_set_score,
+        smaller_data_set_label: names_in_smaller_set_normalized,
+        larger_data_set_label: names_in_larger_set_normalized,
     }
+
+
+
+        
+    #     temp_levenshtein_ratio_normalized = []
+    #     temp_levenshtein_ratio_original = []
+    #     for smaller in smaller_data_set:
+    #         dmv_normalized = damerau_levenshtein_distance(smaller['normalized'], larger['normalized'])
+    #         mean_length_normalized = (len(smaller['normalized']) + len(larger['normalized'])) / 2
+    #         lvs_ratio_normalized = np.cos( 2*dmv_normalized / (mean_length_normalized))
+    #         lvs_ratio_normalized = lvs_ratio_normalized if lvs_ratio_normalized > 0 else 0
+    #         temp_levenshtein_ratio_normalized.append(lvs_ratio_normalized)
+    #         dmv_original = damerau_levenshtein_distance(smaller['original'], larger['original'])
+    #         mean_length_original = (len(smaller['original']) + len(larger['original'])) / 2
+    #         lvs_ratio_original = np.cos( 2*dmv_original / (mean_length_original))
+    #         lvs_ratio_original = lvs_ratio_original if lvs_ratio_original > 0 else 0
+    #         temp_levenshtein_ratio_original.append(lvs_ratio_original)
+    #         matched_pairs.append({
+    #             'levenshtein_ratio_normalized': lvs_ratio_normalized,
+    #             'levenshtein_ratio_original': lvs_ratio_original,
+    #             larger_data_set_label: larger,
+    #             smaller_data_set_label: smaller
+    #         })
+    #         if lvs_ratio_normalized == 1:
+    #             # A perfect fit has been found, no further matching is necessary
+    #             break
+    #     # As some of the names might occur more than once especially after normalization
+    #     names_in_larger_set_normalized[larger['normalized']].append(max(temp_levenshtein_ratio_normalized))
+    #     names_in_larger_set_original[larger['original']].append(max(temp_levenshtein_ratio_original))
+    #     names_in_smaller_set_normalized[smaller['normalized']].append(max(temp_levenshtein_ratio_normalized))
+    #     names_in_smaller_set_original[smaller['original']].append(max(temp_levenshtein_ratio_original))
+        
+    # levenshtein_ratios_smaller_set_normalized = []
+    # levenshtein_ratios_smaller_set_orginal = []
+    # levenshtein_ratios_larger_set_normalized = []
+    # levenshtein_ratios_larger_set_orginal = []
+
+    # for smaller_name_normalized in names_in_smaller_set_normalized:
+    #     tmp_val = 0
+    #     if len(names_in_smaller_set_normalized[smaller_name_normalized]) > 0:
+    #         tmp_val = np.mean(names_in_smaller_set_normalized[smaller_name_normalized])
+    #         if max(names_in_smaller_set_normalized[smaller_name_normalized]) == 1:
+    #             tmp_val = 1
+    #     levenshtein_ratios_smaller_set_normalized.append(tmp_val)
+    # for smaller_name_original in names_in_smaller_set_original:
+    #     tmp_val = 0
+    #     if len(names_in_smaller_set_original[smaller_name_original]) > 0:
+    #         tmp_val = np.mean(names_in_smaller_set_original[smaller_name_original])
+    #         if max(names_in_smaller_set_normalized[smaller_name_normalized]) == 1:
+    #             tmp_val = 1
+    #     levenshtein_ratios_smaller_set_orginal.append(tmp_val)
+    # for larger_name_normalized in names_in_larger_set_normalized:
+    #     tmp_val = 0
+    #     if len(names_in_larger_set_normalized[larger_name_normalized]) > 0:
+    #         tmp_val = np.mean(names_in_larger_set_normalized[larger_name_normalized])
+    #         if max(names_in_larger_set_normalized[larger_name_normalized]) == 1:
+    #             tmp_val = 1
+    #     levenshtein_ratios_larger_set_normalized.append(tmp_val)
+    # for larger_name_original in names_in_larger_set_original:
+    #     tmp_val = 0
+    #     if len(names_in_larger_set_original[larger_name_original]) > 0:
+    #         tmp_val = np.mean(names_in_larger_set_original[larger_name_original])
+    #         if max(names_in_larger_set_normalized[larger_name_normalized]) == 1:
+    #             tmp_val = 1
+    #     levenshtein_ratios_larger_set_orginal.append(tmp_val)
+        
+
+
+    # matched_pairs_sorted = sorted(matched_pairs, key=lambda x: -x['levenshtein_ratio_normalized'])
+    # mean_levenshtein_ratio_normalized = (np.mean(levenshtein_ratios_smaller_set_normalized) + np.mean(levenshtein_ratios_larger_set_normalized)) / 2
+    # median_levenshtein_ratio_normalized = (np.median(levenshtein_ratios_smaller_set_normalized) + np.median(levenshtein_ratios_larger_set_normalized) ) / 2
+    # mean_levenshtein_ratio_original = (np.mean(levenshtein_ratios_smaller_set_orginal) + np.mean(levenshtein_ratios_larger_set_orginal)) / 2
+    # return {
+    #     'mean_levenshtein_ratio_normalized': mean_levenshtein_ratio_normalized,
+    #     'median_levenshtein_ratio_normalized': median_levenshtein_ratio_normalized,
+    #     'mean_levenshtein_ratio_original': mean_levenshtein_ratio_original,
+    #     'levenshtein_ratio_normalized': f'Mean: {mean_levenshtein_ratio_normalized}',
+    #     'levenshtein_ratio_original': f'Mean: {mean_levenshtein_ratio_original}',
+    #     'matched_pairs': matched_pairs_sorted,
+    #     'score': (mean_levenshtein_ratio_normalized + median_levenshtein_ratio_normalized) / 2
+    # }
 
 
 FORENAME_MAX_SCORE_CONTRIBUTION = 25
-FORENAME_MIN_SCORE = 7.5
 SURNAME_MAX_SCORE_CONTRIBUTION = 25
-SURNAME_MIN_SCORE = 7.5
 
 BIRTH_PLACE_MAX_SCORE_CONTRIBUTION = 10
 BIRTH_DATE_MAX_SCORE_CONTRIBUTION = 20
@@ -280,6 +673,8 @@ DEATH_PLACE_MAX_SCORE_CONTRIBUTION = 10
 DEATH_DATE_MAX_SCORE_CONTRIBUTION = 10
 
 MIN_REQUIRED_SCORE_FOR_AUTO_MATCHING = 60
+MIN_TOTAL_SCORE_FOR_MATCH_WITH_PERFECT_RELATIVE_SCORE = 50
+
 
 TOTAL_MAX_SCORE_REACHABLE = FORENAME_MAX_SCORE_CONTRIBUTION + SURNAME_MAX_SCORE_CONTRIBUTION + BIRTH_PLACE_MAX_SCORE_CONTRIBUTION + BIRTH_DATE_MAX_SCORE_CONTRIBUTION + DEATH_PLACE_MAX_SCORE_CONTRIBUTION + DEATH_DATE_MAX_SCORE_CONTRIBUTION
 
@@ -290,12 +685,12 @@ def get_matching_score(local_data_set, external_data_set):
         To get a complete match all values have to be provided.
         Expected layout e.g.:
         {
-            'forenames': 'Anna',
-            'surnames': 'Musterfrau', # (Include all surnames and birthnames, etc. here, preferentially seperated by commas)
-            'birth_place': 'München',
-            'birth_date': 'DD.MM.YYYY',
-            'death_place': 'Dachau',
-            'death_date': 'DD.MM.YYYY',
+            'forenames': ['Anna', 'Anne'],
+            'surnames': ['Musterfrau', 'Levy'], # (Include all surnames and birthnames, etc. here)
+            'birth_place': ['München', 'Bayern'],
+            'birth_date': ['YYYY-MM-DD', '<YYYY-MM-DD'], # Use < or > to indicate smaller or greater dates (only the year will be taken into account then) for fuzzy dates use ** instead of MM or DD
+            'death_place': ['Dachau'],
+            'death_date': ['YYYY-MM-DD'],
         }
     '''
     results = {}
@@ -303,175 +698,335 @@ def get_matching_score(local_data_set, external_data_set):
     absolute_score_original = 0
     max_score_reachable = 0
     name_min_score_reached = True
+    birth_min_score_reached = True
+    death_min_score_reached = True
 
     # NAME information
+    local_forenames = {}
+    external_forenames = {}
+    forename_results = {}
+    if 'forenames' in local_data_set:
+        local_forenames = get_names_as_dict(local_data_set['forenames'], False)
+        forename_results['local'] = local_forenames
 
-    if 'forenames' in local_data_set and 'forenames' in external_data_set:
-        local_forenames = get_names_as_list(local_data_set['forenames'])
-        external_forenames = get_names_as_list(external_data_set['forenames'])
-        if len(local_forenames) > 0 and len(external_forenames) > 0:
-            forename_results = match_against_local_data(local_forenames, external_forenames)
-            forename_score = FORENAME_MAX_SCORE_CONTRIBUTION * forename_results['score']**2
-            forename_score_original = FORENAME_MAX_SCORE_CONTRIBUTION * forename_results['mean_levenshtein_ratio_original']**2
-            results['forename'] = forename_results
-            results['forename']['score'] = forename_score
-            results['forename']['score_original'] = forename_score_original
-            max_score_reachable += FORENAME_MAX_SCORE_CONTRIBUTION
-            absolute_score += forename_score
-            absolute_score_original += forename_score_original
-            if forename_score < FORENAME_MIN_SCORE:
-                name_min_score_reached = False
+    if 'forenames' in external_data_set:
+        external_forenames = get_names_as_dict(external_data_set['forenames'], False)
+        forename_results['external'] = external_forenames
 
-    if 'surnames' in local_data_set and 'surnames' in external_data_set:
-        local_surnames = get_names_as_list(local_data_set['surnames'], is_surname=True)
-        external_surnames = get_names_as_list(external_data_set['surnames'], is_surname=True)
-        if len(local_surnames) > 0 and len(external_surnames) > 0:
-            surname_results = match_against_local_data(local_surnames, external_surnames)
-            surname_score = SURNAME_MAX_SCORE_CONTRIBUTION * surname_results['score']**2
-            surname_score_original = SURNAME_MAX_SCORE_CONTRIBUTION * surname_results['mean_levenshtein_ratio_original']**2
-            results['surname'] = surname_results
-            results['surname']['score'] = surname_score
-            results['surname']['score_original'] = surname_score_original
-            max_score_reachable += SURNAME_MAX_SCORE_CONTRIBUTION
-            absolute_score += surname_score
-            absolute_score_original += surname_score_original
-            if surname_score < SURNAME_MIN_SCORE:
-                name_min_score_reached = False
+    if len(local_forenames) > 0 and len(external_forenames) > 0:
+        forename_results = match_against_local_data(local_forenames, external_forenames, True)
+
+        forename_score = forename_results['score'] * FORENAME_MAX_SCORE_CONTRIBUTION
+        max_score_reachable += FORENAME_MAX_SCORE_CONTRIBUTION
+        absolute_score += forename_score
+
+        forename_results['absolute_score'] = forename_score
+        forename_results['max_absolute_score'] = FORENAME_MAX_SCORE_CONTRIBUTION
+
+    results['forename'] = forename_results
+
+    local_surnames = {}
+    external_surnames = {}
+    surname_results = {}
+    if 'surnames' in local_data_set:
+        local_surnames = get_names_as_dict(local_data_set['surnames'], True)
+        surname_results['local'] = local_surnames
+
+    if 'surnames' in external_data_set:
+        external_surnames = get_names_as_dict(external_data_set['surnames'], True)
+        surname_results['external'] = external_surnames
+
+    if len(local_surnames) > 0 and len(external_surnames) > 0:
+        surname_results = match_against_local_data(local_surnames, external_surnames, False)
+
+        surname_score = surname_results['score'] * SURNAME_MAX_SCORE_CONTRIBUTION
+        max_score_reachable += SURNAME_MAX_SCORE_CONTRIBUTION
+        absolute_score += surname_score
+
+        surname_results['absolute_score'] = surname_score
+        surname_results['max_absolute_score'] = SURNAME_MAX_SCORE_CONTRIBUTION
+
+    results['surname'] = surname_results
 
     # BIRTH information
             
-    if 'birth_place' in local_data_set and 'birth_place' in external_data_set:
-        local_birth_place = get_names_as_list(local_data_set['birth_place'])
-        external_birth_place = get_names_as_list(external_data_set['birth_place'])
-        if len(local_birth_place) > 0 and len(external_birth_place) > 0:
-            birth_place_results = match_against_local_data(local_birth_place, external_birth_place)
-            if birth_place_results['matched_pairs'][0]['levenshtein_ratio_normalized'] == 1:
-                # For places if we get a perfect match on one of the entries we accept the entire matched string as a perfect match
-                # Background often Place of Birth / Death might be formated differently e.g. localy: München / Bayern | externaly: München - Freistaat Bayern
-                # even though this is obviously a match the score would be relatively small due tue the different formating
-                birth_place_score = BIRTH_PLACE_MAX_SCORE_CONTRIBUTION
-            else:
-                birth_place_score = BIRTH_PLACE_MAX_SCORE_CONTRIBUTION * birth_place_results['mean_levenshtein_ratio_normalized']
-            birth_place_score_original = BIRTH_PLACE_MAX_SCORE_CONTRIBUTION * birth_place_results['mean_levenshtein_ratio_original']
-            results['birth_place'] = birth_place_results
-            results['birth_place']['score'] = birth_place_score
-            results['birth_place']['score_original'] = birth_place_score_original
-            max_score_reachable += BIRTH_PLACE_MAX_SCORE_CONTRIBUTION
-            absolute_score += birth_place_score
-            absolute_score_original += birth_place_score_original
+    
+    local_birth_place = {}
+    external_birth_place = {}
+    birth_place_results = {}
+    if 'birth_place' in local_data_set:
+        local_birth_place = get_names_as_dict(local_data_set['birth_place'], False)
+        birth_place_results['local'] = local_birth_place
 
-    if 'birth_date' in local_data_set and 'birth_date' in external_data_set:
-        if len(local_data_set['birth_date']) == 10 and len(external_data_set['birth_date']) == 10:
-            birth_date_result = match_date_against_local_date(local_data_set['birth_date'], external_data_set['birth_date'])
-            birth_date_score = BIRTH_DATE_MAX_SCORE_CONTRIBUTION * birth_date_result['score']
-            # Added a penalty for massive deviations in the year
+    if 'birth_place' in external_data_set:
+        external_birth_place = get_names_as_dict(external_data_set['birth_place'], False)
+        birth_place_results['external'] = external_birth_place
 
-            results['birth_date'] = {
-                'levenshtein_distance': birth_date_result['levenshtein_distance'],
-                'local': local_data_set['birth_date'],
-                'external': external_data_set['birth_date'],
-                'score': birth_date_score
-            }
-            max_score_reachable += BIRTH_DATE_MAX_SCORE_CONTRIBUTION
-            absolute_score += birth_date_score
-            absolute_score_original += birth_date_score
+    if len(local_birth_place) > 0 and len(external_birth_place) > 0:
+        birth_place_results = match_against_local_data(local_birth_place, external_birth_place, True)
 
+        birth_place_results['score'] = birth_place_results['smaller_data_set_score'] # Override the combined score with the one for the smaller data set only (As the place formating might differ to a great extend)
+
+        birth_place_score = birth_place_results['score'] * BIRTH_PLACE_MAX_SCORE_CONTRIBUTION
+        max_score_reachable += BIRTH_PLACE_MAX_SCORE_CONTRIBUTION
+        absolute_score += birth_place_score
+
+        birth_place_results['absolute_score'] = birth_place_score
+        birth_place_results['max_absolute_score'] = BIRTH_PLACE_MAX_SCORE_CONTRIBUTION
+
+    results['birth_place'] = birth_place_results
+
+
+    local_birth_date = {}
+    external_birth_date = {}
+    birth_date_results = {}
+    if 'birth_date' in local_data_set:
+        local_birth_date = local_data_set['birth_date']
+        birth_date_results['local'] = ', '.join(local_data_set['birth_date'])
+
+    if 'birth_date' in external_data_set:
+        external_birth_date = external_data_set['birth_date']
+        birth_date_results['external'] = ', '.join(external_data_set['birth_date'])
+
+    if len(local_birth_date) > 0 and len(external_birth_date) > 0:
+
+        birth_date_results = match_date_against_local_date(local_birth_date, external_birth_date)
+    
+        birth_date_score = BIRTH_DATE_MAX_SCORE_CONTRIBUTION * birth_date_results['score']
+        max_score_reachable += BIRTH_DATE_MAX_SCORE_CONTRIBUTION
+        absolute_score += birth_date_score
+
+        birth_date_results['absolute_score'] = birth_date_score
+        birth_date_results['max_absolute_score'] = BIRTH_DATE_MAX_SCORE_CONTRIBUTION
+
+    results['birth_date'] = birth_date_results
     # DEATH information
-
-    if 'death_place' in local_data_set and 'death_place' in external_data_set:
-        local_death_place = get_names_as_list(local_data_set['death_place'])
-        external_death_place = get_names_as_list(external_data_set['death_place'])
-        if len(local_death_place) > 0 and len(external_death_place) > 0:
-            death_place_results = match_against_local_data(local_death_place, external_death_place)
-            if death_place_results['matched_pairs'][0]['levenshtein_ratio_normalized'] == 1:
-                death_place_score = DEATH_PLACE_MAX_SCORE_CONTRIBUTION
-            else:
-                death_place_score = DEATH_PLACE_MAX_SCORE_CONTRIBUTION * death_place_results['mean_levenshtein_ratio_normalized']
-            death_place_score_original = DEATH_PLACE_MAX_SCORE_CONTRIBUTION * death_place_results['mean_levenshtein_ratio_original']
-            results['death_place'] = death_place_results
-            results['death_place']['score'] = death_place_score
-            results['death_place']['score_original'] = death_place_score_original
-            max_score_reachable += DEATH_PLACE_MAX_SCORE_CONTRIBUTION
-            absolute_score += death_place_score
-            absolute_score_original += death_place_score_original
     
 
-    if 'death_date' in local_data_set and 'death_date' in external_data_set:
-        if len(local_data_set['death_date']) == 10 and len(external_data_set['death_date']) == 10:
-            death_date_result = match_date_against_local_date(local_data_set['death_date'], external_data_set['death_date'])
-            death_date_score = DEATH_DATE_MAX_SCORE_CONTRIBUTION * death_date_result['score']
-            # Added a penalty for massive deviations in the year
+    local_death_place = {}
+    external_death_place = {}
+    death_place_results = {}
+    if 'death_place' in local_data_set:
+        local_death_place = get_names_as_dict(local_data_set['death_place'], False)
+        death_place_results['local'] = local_death_place
 
-            results['death_date'] = {
-                'levenshtein_distance': death_date_result['levenshtein_distance'],
-                'local': local_data_set['death_date'],
-                'external': external_data_set['death_date'],
-                'score': death_date_score
-            }
-            max_score_reachable += DEATH_DATE_MAX_SCORE_CONTRIBUTION
-            absolute_score += death_date_score
-            absolute_score_original += death_date_score
+    if 'death_place' in external_data_set:
+        external_death_place = get_names_as_dict(external_data_set['death_place'], False)
+        death_place_results['external'] = external_death_place
 
-    if not name_min_score_reached:
-        absolute_score -= SURNAME_MAX_SCORE_CONTRIBUTION
+    if len(local_death_place) > 0 and len(external_death_place) > 0:
+
+        death_place_results = match_against_local_data(local_death_place, external_death_place, True)
+
+        death_place_results['score'] = death_place_results['smaller_data_set_score']
+        death_place_score = death_place_results['score'] * DEATH_PLACE_MAX_SCORE_CONTRIBUTION
+        max_score_reachable += DEATH_PLACE_MAX_SCORE_CONTRIBUTION
+        absolute_score += death_place_score
+
+        death_place_results['absolute_score'] = death_place_score
+        death_place_results['max_absolute_score'] = DEATH_PLACE_MAX_SCORE_CONTRIBUTION
+
+    results['death_place'] = death_place_results
+
+    local_death_date = {}
+    external_death_date = {}
+    death_date_results = {}
+    if 'death_date' in local_data_set:
+        local_death_date = local_data_set['death_date']
+        death_date_results['local'] = ', '.join(local_data_set['death_date'])
+
+    if 'death_date' in external_data_set:
+        external_death_date = external_data_set['death_date']
+        death_date_results['external'] = ', '.join(external_data_set['death_date'])
+
+    if len(local_death_date) > 0 and len(external_death_date) > 0:
+
+        death_date_results = match_date_against_local_date(local_death_date, external_death_date)
+    
+        death_date_score = DEATH_DATE_MAX_SCORE_CONTRIBUTION * death_date_results['score']
+        max_score_reachable += DEATH_DATE_MAX_SCORE_CONTRIBUTION
+        absolute_score += death_date_score
+
+        death_date_results['absolute_score'] = death_date_score
+        death_date_results['max_absolute_score'] = DEATH_DATE_MAX_SCORE_CONTRIBUTION
+
+    results['death_date'] = death_date_results
+
     relative_score = ( absolute_score / max_score_reachable ) if max_score_reachable > 0 else 0
-    total_score = (max_score_reachable / TOTAL_MAX_SCORE_REACHABLE ) * relative_score * 100
-    relative_score_original = ( absolute_score_original / max_score_reachable ) if max_score_reachable > 0 else 0
-    total_score_original = (max_score_reachable / TOTAL_MAX_SCORE_REACHABLE ) * relative_score_original * 100
 
+    automatically_matched = absolute_score >= MIN_REQUIRED_SCORE_FOR_AUTO_MATCHING
+    if relative_score == 1 and absolute_score >= MIN_TOTAL_SCORE_FOR_MATCH_WITH_PERFECT_RELATIVE_SCORE:
+        automatically_matched = True
+    
     return {
         **results,
         'absolute_score': absolute_score,
         'relative_score': relative_score,
-        'total_score': total_score,
-        'name_min_score_reached': name_min_score_reached,
-        'absolute_score_original': absolute_score_original,
-        'relative_score_original': relative_score_original,
-        'total_score_original': total_score_original,
-        'automatically_matched': total_score > MIN_REQUIRED_SCORE_FOR_AUTO_MATCHING
+        'max_score_reachable': max_score_reachable,
+        'automatically_matched': bool(automatically_matched),
+        'matching_algorithm_version': AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING
     }
 
+def convert_dict_to_string(values, total_score=None):
+    result = ""
+    for x in values:
+        if len(result) > 0:
+            result += ', '
+        if values[x] != None:
+            if type(values[x]) == list:
+                result += f'{x} {{{", ".join(values[x])}}}'
+            elif type(values[x]) == float:
+                result += f'{x} ({values[x]:.2f})'
+            else:
+                result += f'{x} ({values[x]})'
+        else:
+            result += x
 
-def get_results_as_html(result):
-    style = "background-color: green;" if result["automatically_matched"] else "background-color: red;"
-    automatched_message = " Automatically matched" if result["automatically_matched"] else ''
-    output = f'<h1>Total Score: <b style="padding:4px; color: white; border-radius:4px;{style}">{result["total_score"]}</b>{automatched_message}</h1>'
-    output += f'<p>Minimum score for automatching: {MIN_REQUIRED_SCORE_FOR_AUTO_MATCHING}</p>'
-    table_header = '<table><tr><th>Local value</th><th>External value</th><th>Levenshtein ratio</th></tr>'
-    if 'forename' in result:
-        output += f'<h2>Forename:</h2><p>Score: <b>{result["forename"]["score"]} of {FORENAME_MAX_SCORE_CONTRIBUTION}<b></p><p>Mean Levenshtein ratio: <b>{result["forename"]["mean_levenshtein_ratio_normalized"]} ({result["forename"]["mean_levenshtein_ratio_original"]})<b></p>{table_header}'
-        for value_pair in result['forename']['matched_pairs']:
-            output += f'<tr><td>{value_pair["local"]}</td><td>{value_pair["external"]}</td><td>{value_pair["levenshtein_ratio_normalized"]} ({value_pair["levenshtein_ratio_original"]})</td></tr>'
-        output += '</table>'
-        
-    if 'surname' in result:
-        output += f'<h2>Surname:</h2><p>Score: <b>{result["surname"]["score"]} of {SURNAME_MAX_SCORE_CONTRIBUTION}<b></p><p>Mean Levenshtein ratio: <b>{result["surname"]["mean_levenshtein_ratio_normalized"]} ({result["surname"]["mean_levenshtein_ratio_original"]})<b></p>{table_header}'
-        for value_pair in result['surname']['matched_pairs']:
-            output += f'<tr><td>{value_pair["local"]}</td><td>{value_pair["external"]}</td><td>{value_pair["levenshtein_ratio_normalized"]} ({value_pair["levenshtein_ratio_original"]})</td></tr>'
-        output += '</table>'
+    if total_score != None:
+        result += f' [{total_score:.2f}]'
+    return result
+
+def comparison_html_bar_chart(max_absolute_score, score=None, absolute_score=None, relative_score=None):
+    red, green, blue = 50, 50, 50
+    percentage = 1
+    text_anchor = "end"
+    text_start = "-4"
+    if relative_score != None:
+        score = relative_score
+    if score != None:
+        percentage = (1+score)/2
+        blue = 0
+        green = 200 * np.sqrt( np.sin ( percentage * np.pi / 2 ))
+        red = 255 * np.sqrt( np.cos ( percentage * np.pi / 2 ))
     
-    if 'birth_date' in result:
-        output += f'<h2>Date of birth:</h2><p>Score: <b>{result["birth_date"]["score"]} of {BIRTH_DATE_MAX_SCORE_CONTRIBUTION}<b></p><p>Levenshtein distance: <b>{result["birth_date"]["levenshtein_distance"]}<b></p>{table_header}'
-        output += f'<tr><td>{result["birth_date"]["local"]}</td><td>{result["birth_date"]["external"]}</td><td>{result["birth_date"]["levenshtein_distance"]}</td></tr>'
-        output += '</table>'
+    result = f'''<div style="white-space:nowrap; border-top: 2px solid #ccc; background-color: #888; text-align: center; overflow: hidden;">
+        <svg xmlns="http://www.w3.org/2000/svg" style="width: 100%; min-height: 16px; margin-bottom: -3px;" viewBox="-100 0 200 30" >'''
 
-    if 'birth_place' in result:
-        output += f'<h2>Place of birth:</h2><p>Score: <b>{result["birth_place"]["score"]} of {BIRTH_PLACE_MAX_SCORE_CONTRIBUTION}<b></p><p>Mean Levenshtein ratio: <b>{result["birth_place"]["mean_levenshtein_ratio_normalized"]} ({result["birth_place"]["mean_levenshtein_ratio_original"]})<b></p>{table_header}'
-        for value_pair in result['birth_place']['matched_pairs']:
-            output += f'<tr><td>{value_pair["local"]}</td><td>{value_pair["external"]}</td><td>{value_pair["levenshtein_ratio_normalized"]} ({value_pair["levenshtein_ratio_original"]})</td></tr>'
-        output += '</table>'
+    if relative_score == None:
+        result += '<line x1="0" y1="0" x2="0" y2="30" stroke-width="2" stroke="#000"/>'
+        if score:
+            if score < 0:
+                text_anchor = "start"
+                text_start = "4"
+            result += f'<line x1="{score * 100}" y1="15" x2="0" y2="15" stroke-width="30" stroke="rgb({red}, {green}, {blue})"/>'
 
-    if 'death_date' in result:
-        output += f'<h2>Date of death:</h2><p>Score: <b>{result["death_date"]["score"]} of {DEATH_DATE_MAX_SCORE_CONTRIBUTION}<b></p><p>Levenshtein distance: <b>{result["death_date"]["levenshtein_distance"]}<b></p>{table_header}'
-        output += f'<tr><td>{result["death_date"]["local"]}</td><td>{result["death_date"]["external"]}</td><td>{result["death_date"]["levenshtein_distance"]}</td></tr>'
-        output += '</table>'
+        absolute_score = f"{absolute_score:.2f}" if absolute_score != None else '-'
+        result += f'<text text-anchor="{text_anchor}" x="{text_start}" y="21" font-size="16" font-weight="bold"> {absolute_score} / {max_absolute_score} </text>'
+    else:    
+        absolute_score = f"{absolute_score:.2f}" if absolute_score != None else '-'
+        result += f'<line x1="-100" y1="15" x2="{-100 + relative_score * 200}" y2="15" stroke-width="30" stroke="rgb({red}, {green}, {blue})"/>'
+        result += f'<text text-anchor="middle" x="0" y="21" font-size="16" font-weight="bold">{absolute_score} / {max_absolute_score} ({100*relative_score:.2f} %)</text>'
 
-    if 'death_place' in result:
-        output += f'<h2>Place of death:</h2><p>Score: <b>{result["death_place"]["score"]} of {DEATH_PLACE_MAX_SCORE_CONTRIBUTION}<b></p><p>Mean Levenshtein ratio: <b>{result["death_place"]["mean_levenshtein_ratio_normalized"]} ({result["death_place"]["mean_levenshtein_ratio_original"]})<b></p>{table_header}'
-        for value_pair in result['death_place']['matched_pairs']:
-            output += f'<tr><td>{value_pair["local"]}</td><td>{value_pair["external"]}</td><td>{value_pair["levenshtein_ratio_normalized"]} ({value_pair["levenshtein_ratio_original"]})</td></tr>'
-        output += '</table>'
+    
+    
+    
+    result += '</svg></div>'
+
+    return result
+
+
+def comparison_html_table_cell(max_absolute_score, score=None, absolute_score=None, local_value=None, external_value=None, info=None, relative_score=None, automatically_matched=False):
+    color = "#fff"
+    background = "#555"
+    if score != None:
+        color = "#000"
+        background = "transparent"
+    result = f'<td class="comparison" style="background-color: {background}; color: {color}; min-width: 120px; max-width: 140px; vertical-align: bottom;"><div style="display: flex; flex-wrap: nowrap; flex-direction: column; align-items: stretch; border-radius: 4px; overflow: hidden; border: 1px solid #ccc;">'
+    if info != None:
+        result += f'<div style="padding: 4px 6px;">{info}</div>'
+    elif relative_score != None:
+        matched = "✅︎" if automatically_matched else "❌"
+        result += f'<div style="padding: 4px 6px; text-align: center;">Meets criteria: {matched}</div>'
+        result += comparison_html_bar_chart(max_absolute_score, absolute_score=absolute_score, relative_score=relative_score)
+    elif external_value != None and local_value != None:
+        result += f'<div style="padding: 4px 6px;">{external_value if len(external_value) else "-"}</div><div style="background-color: rgba(0, 169, 176, 0.3); padding: 4px 6px;">{local_value if len(local_value) > 0 else "-"}</div>'
+    else:
+        result += f'<div style="padding: 4px 6px;">---</div><div style="background-color: rgba(0, 169, 176, 0.3); padding: 4px 6px;">---</div>'
+    
+    result += comparison_html_bar_chart(max_absolute_score, score, absolute_score) + '</div></td>'
+    return result
+
+def get_result_as_html_table_row(potential_match, num=None, **kwargs):
+    result = '<tr>'
+    if num != None:
+        result += f'<td>{num}</td>'
+    if 'matched' in kwargs:
+        result += f'<td>{kwargs.get("matched")}</td>'
+
+    surname = potential_match.get('surname', {})
+    forename = potential_match.get('forename', {})
+    birth_date = potential_match.get('birth_date', {})
+    birth_place = potential_match.get('birth_place', {})
+    death_date = potential_match.get('death_date', {})
+    death_place = potential_match.get('death_place', {})
+
+    result += comparison_html_table_cell(potential_match.get('max_score_reachable', 0), score=potential_match.get('absolute_score', 0) / 100, absolute_score=potential_match.get('absolute_score', None), relative_score=potential_match.get('relative_score', None), automatically_matched=potential_match.get('automatically_matched', False))
+
+    result += comparison_html_table_cell(SURNAME_MAX_SCORE_CONTRIBUTION, local_value=convert_dict_to_string(surname.get('local', {}), surname.get('local_score', None)), external_value=convert_dict_to_string(surname.get('external', {}), surname.get('external_score', None)), score=surname.get('score', None), absolute_score=surname.get('absolute_score', None))
+    result += comparison_html_table_cell(FORENAME_MAX_SCORE_CONTRIBUTION, local_value=convert_dict_to_string(forename.get('local', {}), forename.get('local_score', None)), external_value=convert_dict_to_string(forename.get('external', {}), forename.get('external_score', None)), score=forename.get('score', None), absolute_score=forename.get('absolute_score', None))
+
+    result += comparison_html_table_cell(BIRTH_DATE_MAX_SCORE_CONTRIBUTION, local_value=birth_date.get('local', ''), external_value=birth_date.get('external', ''), score=birth_date.get('score', None), absolute_score=birth_date.get('absolute_score', None))
+    result += comparison_html_table_cell(BIRTH_PLACE_MAX_SCORE_CONTRIBUTION, local_value=convert_dict_to_string(birth_place.get('local', {}), birth_place.get('local_score', None)), external_value=convert_dict_to_string(birth_place.get('external', {}), birth_place.get('external_score', None)), score=birth_place.get('score', None), absolute_score=birth_place.get('absolute_score', None))
+
+    result += comparison_html_table_cell(DEATH_DATE_MAX_SCORE_CONTRIBUTION, local_value=death_date.get('local', ''), external_value=death_date.get('external', ''), score=death_date.get('score', None), absolute_score=death_date.get('absolute_score', None))
+    result += comparison_html_table_cell(DEATH_PLACE_MAX_SCORE_CONTRIBUTION, local_value=convert_dict_to_string(death_place.get('local', {}), death_place.get('local_score', None)), external_value=convert_dict_to_string(death_place.get('external', {}), death_place.get('external_score', None)), score=death_place.get('score', None), absolute_score=death_place.get('absolute_score', None))
+
+
+    if 'es_score' in potential_match:
+        result += f'<td>{potential_match.get("es_score")}</td>'
+    if 'link' in kwargs:
+        result += f'<td>{kwargs.get("link")}</td>'
+
+    result += "</tr>"
+    
+    return result
+
+
+
+def get_results_as_html(results):
+    if type(results) != list:
+        results = [results]
+    output = f'<table><tr style="text-align: center;"><th style="text-align: center;">Score</th><th style="text-align: center;">Surname</th><th style="text-align: center;">Forename</th><th style="text-align: center;">Birth date</th><th style="text-align: center;">Birth place</th><th style="text-align: center;">Death date</th><th style="text-align: center;">Death place</th></tr>'
+    for result in results:
+        output += get_result_as_html_table_row(result)
+    output += '</body></table>'
+
+    # table_header = '<table><tr><th>Type</th><th>Local value</th><th>External value</th><th>Score</th></tr>'
+    # if 'forename' in result:
+    #     output += f'<tr><td><h2>Forename:</h2></td><td>{", ".join()}</td><td>{result["forename"]["absolute_score"]} of {FORENAME_MAX_SCORE_CONTRIBUTION}</td><td></p><p>Mean Levenshtein ratio: <b>{result["forename"]["mean_levenshtein_ratio_normalized"]} ({result["forename"]["mean_levenshtein_ratio_original"]})<b></p>{table_header}'
+    #     for value_pair in result['forename']['matched_pairs']:
+    #         output += f'<tr><td>{value_pair["local"]}</td><td>{value_pair["external"]}</td><td>{value_pair["levenshtein_ratio_normalized"]} ({value_pair["levenshtein_ratio_original"]})</td></tr>'
+    #     output += '</table>'
+        
+    # if 'surname' in result:
+    #     output += f'<h2>Surname:</h2><p>Score: <b>{result["surname"]["absolute_score"]} of {SURNAME_MAX_SCORE_CONTRIBUTION}<b></p><p>Mean Levenshtein ratio: <b>{result["surname"]["mean_levenshtein_ratio_normalized"]} ({result["surname"]["mean_levenshtein_ratio_original"]})<b></p>{table_header}'
+    #     for value_pair in result['surname']['matched_pairs']:
+    #         output += f'<tr><td>{value_pair["local"]}</td><td>{value_pair["external"]}</td><td>{value_pair["levenshtein_ratio_normalized"]} ({value_pair["levenshtein_ratio_original"]})</td></tr>'
+    #     output += '</table>'
+    
+    # if 'birth_date' in result:
+    #     output += f'<h2>Date of birth:</h2><p>Score: <b>{result["birth_date"]["absolute_score"]} of {BIRTH_DATE_MAX_SCORE_CONTRIBUTION}<b></p><p>Levenshtein distance: <b>{result["birth_date"]["levenshtein_distance"]}<b></p>{table_header}'
+    #     output += f'<tr><td>{result["birth_date"]["local"]}</td><td>{result["birth_date"]["external"]}</td><td>{result["birth_date"]["levenshtein_distance"]}</td></tr>'
+    #     output += '</table>'
+
+    # if 'birth_place' in result:
+    #     output += f'<h2>Place of birth:</h2><p>Score: <b>{result["birth_place"]["absolute_score"]} of {BIRTH_PLACE_MAX_SCORE_CONTRIBUTION}<b></p><p>Mean Levenshtein ratio: <b>{result["birth_place"]["mean_levenshtein_ratio_normalized"]} ({result["birth_place"]["mean_levenshtein_ratio_original"]})<b></p>{table_header}'
+    #     for value_pair in result['birth_place']['matched_pairs']:
+    #         output += f'<tr><td>{value_pair["local"]}</td><td>{value_pair["external"]}</td><td>{value_pair["levenshtein_ratio_normalized"]} ({value_pair["levenshtein_ratio_original"]})</td></tr>'
+    #     output += '</table>'
+
+    # if 'death_date' in result:
+    #     output += f'<h2>Date of death:</h2><p>Score: <b>{result["death_date"]["absolute_score"]} of {DEATH_DATE_MAX_SCORE_CONTRIBUTION}<b></p><p>Levenshtein distance: <b>{result["death_date"]["levenshtein_distance"]}<b></p>{table_header}'
+    #     output += f'<tr><td>{result["death_date"]["local"]}</td><td>{result["death_date"]["external"]}</td><td>{result["death_date"]["levenshtein_distance"]}</td></tr>'
+    #     output += '</table>'
+
+    # if 'death_place' in result:
+    #     output += f'<h2>Place of death:</h2><p>Score: <b>{result["death_place"]["absolute_score"]} of {DEATH_PLACE_MAX_SCORE_CONTRIBUTION}<b></p><p>Mean Levenshtein ratio: <b>{result["death_place"]["mean_levenshtein_ratio_normalized"]} ({result["death_place"]["mean_levenshtein_ratio_original"]})<b></p>{table_header}'
+    #     for value_pair in result['death_place']['matched_pairs']:
+    #         output += f'<tr><td>{value_pair["local"]}</td><td>{value_pair["external"]}</td><td>{value_pair["levenshtein_ratio_normalized"]} ({value_pair["levenshtein_ratio_original"]})</td></tr>'
+    #     output += '</table>'
 
     return output
 
 
+#>1941-01-01
