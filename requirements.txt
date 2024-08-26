@@ -1,4 +1,5 @@
 levenshtein~=0.25
-numpy~=1.26
+numpy
 pyIcu~=2.13.1
 pyxdameraulevenshtein
+doublemetaphone

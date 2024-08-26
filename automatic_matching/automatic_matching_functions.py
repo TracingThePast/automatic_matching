@@ -11,7 +11,7 @@ from pyxdameraulevenshtein import damerau_levenshtein_distance, normalized_damer
 from rapidfuzz import fuzz
 from doublemetaphone import doublemetaphone
 
-AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.0"
+AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.1"
 
 
 latin_transliterator = icu.Transliterator.createInstance('Any-Latin; Latin-ASCII;IPA-XSampa;NFD; [:Nonspacing Mark:] Remove; NFC; Lower();')
@@ -855,8 +855,8 @@ def get_matching_score(local_data_set, external_data_set):
     relative_score = ( absolute_score / max_score_reachable ) if max_score_reachable > 0 else 0
 
     automatically_matched = absolute_score >= MIN_REQUIRED_SCORE_FOR_AUTO_MATCHING
-    if relative_score == 1 and absolute_score >= MIN_TOTAL_SCORE_FOR_MATCH_WITH_PERFECT_RELATIVE_SCORE:
-        automatically_matched = True
+    # if relative_score == 1 and absolute_score >= MIN_TOTAL_SCORE_FOR_MATCH_WITH_PERFECT_RELATIVE_SCORE:
+    #     automatically_matched = True
     
     return {
         **results,
