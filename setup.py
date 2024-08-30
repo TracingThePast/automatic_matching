@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='automatic_matching',
-    version='2.1.0',    
+    version='2.2.0',    
     description='An automatic matching algorithm that allows to link references to the same person in multiple independent databases, based on a list of search criteria.',
     url='https://github.com/TracingThePast/automatic_matching',
     author='Jan Bernrader',

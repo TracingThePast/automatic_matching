@@ -11,7 +11,7 @@ from pyxdameraulevenshtein import damerau_levenshtein_distance, normalized_damer
 from rapidfuzz import fuzz
 from doublemetaphone import doublemetaphone
 
-AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.1"
+AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.2"
 
 
 latin_transliterator = icu.Transliterator.createInstance('Any-Latin; Latin-ASCII;IPA-XSampa;NFD; [:Nonspacing Mark:] Remove; NFC; Lower();')
@@ -697,6 +697,7 @@ def get_matching_score(local_data_set, external_data_set):
     absolute_score = 0
     absolute_score_original = 0
     max_score_reachable = 0
+    max_total_score_reachable = 0
     name_min_score_reached = True
     birth_min_score_reached = True
     death_min_score_reached = True
@@ -723,6 +724,9 @@ def get_matching_score(local_data_set, external_data_set):
         forename_results['absolute_score'] = forename_score
         forename_results['max_absolute_score'] = FORENAME_MAX_SCORE_CONTRIBUTION
 
+    if len(local_forenames) > 0 or len(external_forenames) > 0:
+        max_total_score_reachable += FORENAME_MAX_SCORE_CONTRIBUTION
+
     results['forename'] = forename_results
 
     local_surnames = {}
@@ -745,6 +749,9 @@ def get_matching_score(local_data_set, external_data_set):
 
         surname_results['absolute_score'] = surname_score
         surname_results['max_absolute_score'] = SURNAME_MAX_SCORE_CONTRIBUTION
+
+    if len(local_surnames) > 0 or len(external_surnames) > 0:
+        max_total_score_reachable += SURNAME_MAX_SCORE_CONTRIBUTION
 
     results['surname'] = surname_results
 
@@ -774,6 +781,9 @@ def get_matching_score(local_data_set, external_data_set):
         birth_place_results['absolute_score'] = birth_place_score
         birth_place_results['max_absolute_score'] = BIRTH_PLACE_MAX_SCORE_CONTRIBUTION
 
+    if len(local_birth_place) > 0 or len(external_birth_place) > 0:
+        max_total_score_reachable += BIRTH_PLACE_MAX_SCORE_CONTRIBUTION
+
     results['birth_place'] = birth_place_results
 
 
@@ -798,6 +808,9 @@ def get_matching_score(local_data_set, external_data_set):
 
         birth_date_results['absolute_score'] = birth_date_score
         birth_date_results['max_absolute_score'] = BIRTH_DATE_MAX_SCORE_CONTRIBUTION
+
+    if len(local_birth_date) > 0 or len(external_birth_date) > 0:
+        max_total_score_reachable += BIRTH_DATE_MAX_SCORE_CONTRIBUTION
 
     results['birth_date'] = birth_date_results
     # DEATH information
@@ -826,6 +839,9 @@ def get_matching_score(local_data_set, external_data_set):
         death_place_results['absolute_score'] = death_place_score
         death_place_results['max_absolute_score'] = DEATH_PLACE_MAX_SCORE_CONTRIBUTION
 
+    if len(local_death_place) > 0 or len(external_death_place) > 0:
+        max_total_score_reachable += DEATH_PLACE_MAX_SCORE_CONTRIBUTION
+
     results['death_place'] = death_place_results
 
     local_death_date = {}
@@ -849,19 +865,24 @@ def get_matching_score(local_data_set, external_data_set):
 
         death_date_results['absolute_score'] = death_date_score
         death_date_results['max_absolute_score'] = DEATH_DATE_MAX_SCORE_CONTRIBUTION
+    
+    if len(local_death_date) > 0 or len(external_death_date) > 0:
+        max_total_score_reachable += DEATH_DATE_MAX_SCORE_CONTRIBUTION
 
     results['death_date'] = death_date_results
 
     relative_score = ( absolute_score / max_score_reachable ) if max_score_reachable > 0 else 0
+    total_relative_score = ( absolute_score / max_total_score_reachable ) if max_total_score_reachable > 0 else 0
 
     automatically_matched = absolute_score >= MIN_REQUIRED_SCORE_FOR_AUTO_MATCHING
-    # if relative_score == 1 and absolute_score >= MIN_TOTAL_SCORE_FOR_MATCH_WITH_PERFECT_RELATIVE_SCORE:
-    #     automatically_matched = True
+    if total_relative_score == 1 and absolute_score >= MIN_TOTAL_SCORE_FOR_MATCH_WITH_PERFECT_RELATIVE_SCORE:
+        automatically_matched = True
     
     return {
         **results,
         'absolute_score': absolute_score,
         'relative_score': relative_score,
+        'total_relative_score': total_relative_score,
         'max_score_reachable': max_score_reachable,
         'automatically_matched': bool(automatically_matched),
         'matching_algorithm_version': AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING
