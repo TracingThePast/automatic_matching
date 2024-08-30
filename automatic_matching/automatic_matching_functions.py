@@ -11,8 +11,9 @@ from pyxdameraulevenshtein import damerau_levenshtein_distance, normalized_damer
 from rapidfuzz import fuzz
 from doublemetaphone import doublemetaphone
 
-AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.2"
+AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.3"
 
+DATE_COMPARISON_BY_TIMEDELTA_MAX_NUMBER_OF_DAYS = 356 / 2
 
 latin_transliterator = icu.Transliterator.createInstance('Any-Latin; Latin-ASCII;IPA-XSampa;NFD; [:Nonspacing Mark:] Remove; NFC; Lower();')
 # Creates a transliterator that replaces all non latin characters, removes all accents and lowercases the entire string.
@@ -107,7 +108,7 @@ def convert_dates(dates):
         date_split = date_string.split('-')
         if len(date_split) != 3:
             continue
-        if len(date_split[0]) != 4 or len(date_split[1]) != 2 or len(date_split[2]) != 2:
+        if len(date_split[0]) not in [4,5] or len(date_split[1]) != 2 or len(date_split[2]) != 2:
             continue
         date = {
             'year': date_split[0],
@@ -275,7 +276,6 @@ def match_date_against_local_date(local_dates, external_dates):
     result = {}
     converted_local_dates = convert_dates(local_dates)
     converted_external_dates = convert_dates(external_dates)
-
     converted_local_dates_thresholds_len = len(converted_local_dates['thresholds'])
     converted_external_dates_thresholds_len = len(converted_external_dates['thresholds'])
 
@@ -288,7 +288,9 @@ def match_date_against_local_date(local_dates, external_dates):
         converted_external_dates_min = converted_external_dates['thresholds'].get('min', None)
         converted_external_dates_max = converted_external_dates['thresholds'].get('max', None)
 
+        compared_date_ranges = False
         if converted_local_dates_min and converted_external_dates_max:
+            compared_date_ranges = True
             if converted_local_dates_min > converted_external_dates_max:
                 non_matched_date_ranges.append({
                     'local': '!> ' + daterange_as_string(converted_local_dates_min, converted_local_dates_max),
@@ -296,13 +298,14 @@ def match_date_against_local_date(local_dates, external_dates):
                 })
 
         if converted_local_dates_max and converted_external_dates_min:
+            compared_date_ranges = True
             if converted_local_dates_max < converted_external_dates_min:
                 non_matched_date_ranges.append({
                     'local': '! ' + daterange_as_string(converted_local_dates_min, converted_local_dates_max),
                     'external': '!> ' + daterange_as_string(converted_external_dates_min, converted_external_dates_max),
                 })
-        
-        if len(non_matched_date_ranges) == 0:
+
+        if compared_date_ranges and len(non_matched_date_ranges) == 0:
             matched_date_ranges.append({
                 'local': daterange_as_string(converted_local_dates_min, converted_local_dates_max),
                 'external': daterange_as_string(converted_external_dates_min, converted_external_dates_max),
@@ -334,11 +337,17 @@ def match_date_against_local_date(local_dates, external_dates):
                 year_comparison = np.array(damerau_levenshtein_distance_seqs(external_date['year_sequences'][0], local_date['year_sequences']))
                 year_comparison[1:] *= 4
                 year_comparison = year_comparison + year_weights
-                score = np.min(month_day_comparison) + np.min(year_comparison)
+                string_score = np.min(month_day_comparison) + np.min(year_comparison)
+                timedelta_score = 1
+                if 'datetime_from' in local_date and 'datetime_from' in external_date:
+                    timedelta_score = abs((local_date['datetime_from'] - external_date['datetime_from']).days) / DATE_COMPARISON_BY_TIMEDELTA_MAX_NUMBER_OF_DAYS
+                score = min([string_score, timedelta_score])
                 scores.append({
                     'external': f"{external_date['year_sequences'][0]}-{external_date['month_day_sequences'][0]}",
                     'local': f"{local_date['year_sequences'][0]}-{local_date['month_day_sequences'][0]}",
                     'score': score,
+                    'string_score': string_score,
+                    'timedelta_score': timedelta_score,
                 })
     
         
@@ -487,7 +496,32 @@ def match_against_local_data(local_data, external_data, potential_shortform = Fa
         for key in smaller_data_set[smaller]:
             names_in_smaller_set_original[key] = []
         
+    for larger_original in names_in_larger_set_original:
+        damerau_levenshtein_distance_sequences = damerau_levenshtein_distance_seqs(larger_original, list(names_in_smaller_set_original.keys()))
+        if min(damerau_levenshtein_distance_sequences) == 0:
+            # found exact expression in other data set no need for further search.
+            names_in_larger_set_original[larger_original] = 0
+            if larger_original in names_in_smaller_set_original: # if there is an exact match in the smaller data set we can set this to 0 as well
+                names_in_smaller_set_original[larger_original] = 0
+        else:
+            for smaller_original in smaller_data_set:
+                doublemetaphone_matching_score = get_doublemetaphone_matching_score(larger_original, smaller_original, potential_shortform)
+                names_in_larger_set_original[larger_original].append(doublemetaphone_matching_score)
+                if doublemetaphone_matching_score == 0:
+                    break
+            names_in_larger_set_original[larger_original] = min(names_in_larger_set_original[larger_original])
 
+    for smaller_original in names_in_smaller_set_original:
+        if names_in_smaller_set_original[smaller_original] == 0:
+            continue
+
+        for larger_original in larger_data_set:
+            doublemetaphone_matching_score = get_doublemetaphone_matching_score(larger_original, smaller_original, potential_shortform)
+            names_in_smaller_set_original[smaller_original].append(doublemetaphone_matching_score)
+            if doublemetaphone_matching_score == 0:
+                break
+        
+        names_in_smaller_set_original[smaller_original] = min(names_in_smaller_set_original[smaller_original])
 
     for larger in larger_data_set:
         damerau_levenshtein_distance_sequences = damerau_levenshtein_distance_seqs(larger, list(smaller_data_set.keys()))
@@ -503,21 +537,7 @@ def match_against_local_data(local_data, external_data, potential_shortform = Fa
                 if normalized_doublemetaphone_matching_score == 0:
                     # if for the normalized score a perfect match was found we end our search here
                     break
-                
-                break_search_in_original = False
-                for larger_original in larger_data_set[larger]:
-                    if break_search_in_original:
-                        break
-                    for smaller_original in names_in_smaller_set_original:
-                        if break_search_in_original:
-                            break
-                        normalized_doublemetaphone_matching_score = get_doublemetaphone_matching_score(larger_original, smaller_original, potential_shortform)
-                        names_in_larger_set_normalized[larger].append(normalized_doublemetaphone_matching_score)
-                        if normalized_doublemetaphone_matching_score == 0:
-                            break_search_in_original = True
 
-
-            
             names_in_larger_set_normalized[larger] = min(names_in_larger_set_normalized[larger])
 
     
@@ -537,24 +557,13 @@ def match_against_local_data(local_data, external_data, potential_shortform = Fa
                     # if for the normalized score a perfect match was found we end our search here
                     break
                 
-                break_search_in_original = False
-                for smaller_original in smaller_data_set[smaller]:
-                    if break_search_in_original:
-                        break
-                    for larger_original in names_in_larger_set_original:
-                        if break_search_in_original:
-                            break
-                        normalized_doublemetaphone_matching_score = get_doublemetaphone_matching_score(larger_original, smaller_original, potential_shortform)
-                        names_in_smaller_set_normalized[smaller].append(normalized_doublemetaphone_matching_score)
-                        if normalized_doublemetaphone_matching_score == 0:
-                            break_search_in_original = True
-
-
-            
             names_in_smaller_set_normalized[smaller] = min(names_in_smaller_set_normalized[smaller])
         
     smaller_data_set_scores = []
     larger_data_set_scores = []
+    
+    smaller_original_data_set_scores = []
+    larger_original_data_set_scores = []
 
     for smaller in names_in_smaller_set_normalized:
         smaller_data_set_scores.append(names_in_smaller_set_normalized[smaller])
@@ -562,12 +571,18 @@ def match_against_local_data(local_data, external_data, potential_shortform = Fa
     for larger in names_in_larger_set_normalized:
         larger_data_set_scores.append(names_in_larger_set_normalized[larger])
 
+    for smaller_original in names_in_smaller_set_original:
+        smaller_original_data_set_scores.append(names_in_smaller_set_original[smaller_original])
+
+    for larger_original in names_in_larger_set_original:
+        larger_original_data_set_scores.append(names_in_larger_set_original[larger_original])
+
     smaller_data_set_scores.sort()
     larger_data_set_scores.sort()
 
 
-    smaller_data_set_score = np.cos(np.pi * (2 * np.mean(smaller_data_set_scores) + max(smaller_data_set_scores)) / 3)
-    larger_data_set_score = np.cos(np.pi * (2 * np.mean(larger_data_set_scores) + max(larger_data_set_scores)) / 3)
+    smaller_data_set_score = np.cos(np.pi * (8 * np.mean(smaller_data_set_scores) + 4 * max(smaller_data_set_scores) + 2 * np.mean(smaller_original_data_set_scores) + max(smaller_original_data_set_scores)) / 15)
+    larger_data_set_score = np.cos(np.pi * (8 * np.mean(larger_data_set_scores) + 4 * max(larger_data_set_scores) + 2 * np.mean(larger_original_data_set_scores) + max(larger_original_data_set_scores)) / 15)
     score = (smaller_data_set_score + larger_data_set_score ) / 2
     
 
