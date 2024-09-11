@@ -11,9 +11,9 @@ from pyxdameraulevenshtein import damerau_levenshtein_distance, normalized_damer
 from rapidfuzz import fuzz
 from doublemetaphone import doublemetaphone
 
-AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.3"
+AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.4"
 
-DATE_COMPARISON_BY_TIMEDELTA_MAX_NUMBER_OF_DAYS = 356 / 2
+DATE_COMPARISON_BY_TIMEDELTA_MAX_NUMBER_OF_DAYS = 4
 
 latin_transliterator = icu.Transliterator.createInstance('Any-Latin; Latin-ASCII;IPA-XSampa;NFD; [:Nonspacing Mark:] Remove; NFC; Lower();')
 # Creates a transliterator that replaces all non latin characters, removes all accents and lowercases the entire string.
@@ -72,7 +72,7 @@ month_day_weights = np.array([
 
 year_weights = np.array([
     0,
-    0.5,
+    0.75,
 ])
 
 def get_date_sequences(date):
@@ -332,16 +332,22 @@ def match_date_against_local_date(local_dates, external_dates):
         for local_date in converted_local_dates['dates']:
             for external_date in converted_external_dates['dates']:
                 month_day_comparison = np.array(damerau_levenshtein_distance_seqs(external_date['month_day_sequences'][0], local_date['month_day_sequences']))
-                month_day_comparison[1:] *= 4
+                month_day_comparison[1:] *= 6
                 month_day_comparison = month_day_comparison + month_day_weights
                 year_comparison = np.array(damerau_levenshtein_distance_seqs(external_date['year_sequences'][0], local_date['year_sequences']))
-                year_comparison[1:] *= 4
+                year_comparison[1:] *= 2
                 year_comparison = year_comparison + year_weights
                 string_score = np.min(month_day_comparison) + np.min(year_comparison)
+
+                string_score = min(string_score, 3) / 3
                 timedelta_score = 1
+                timedelta_abs = 0
                 if 'datetime_from' in local_date and 'datetime_from' in external_date:
-                    timedelta_score = abs((local_date['datetime_from'] - external_date['datetime_from']).days) / DATE_COMPARISON_BY_TIMEDELTA_MAX_NUMBER_OF_DAYS
-                score = min([string_score, timedelta_score])
+                    timedelta_abs = abs((local_date['datetime_from'] - external_date['datetime_from']).days)
+                    timedelta_score = timedelta_abs / DATE_COMPARISON_BY_TIMEDELTA_MAX_NUMBER_OF_DAYS
+                    if timedelta_abs > 10:
+                        string_score += timedelta_abs / (100 * 356)
+                score = min([string_score, timedelta_score, 1])
                 scores.append({
                     'external': f"{external_date['year_sequences'][0]}-{external_date['month_day_sequences'][0]}",
                     'local': f"{local_date['year_sequences'][0]}-{local_date['month_day_sequences'][0]}",
@@ -350,12 +356,10 @@ def match_date_against_local_date(local_dates, external_dates):
                     'timedelta_score': timedelta_score,
                 })
     
-        
         if len(scores) > 0:
             scores = sorted(scores, key=lambda x: x['score'])
             result = scores[0]
-            score = min(result['score'], 4) / 4
-            result['score'] = np.cos(score * np.pi)
+            result['score'] = np.cos(result['score'] * np.pi)
 
     if len(result) == 0:
         if len(non_matched_date_ranges) > 0:
