@@ -11,7 +11,7 @@ from pyxdameraulevenshtein import damerau_levenshtein_distance, normalized_damer
 from rapidfuzz import fuzz
 from doublemetaphone import doublemetaphone
 
-AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.5"
+AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.6"
 
 DATE_COMPARISON_BY_TIMEDELTA_MAX_NUMBER_OF_DAYS = 4
 
@@ -638,7 +638,7 @@ def match_against_local_data(local_data, external_data, disregard_data_set={}, p
     if len(local_data) == len(external_data):
         score = (smaller_data_set_score + larger_data_set_score ) / 2
     else:
-        score = (2*smaller_data_set_score + larger_data_set_score ) / 3
+        score = (4*smaller_data_set_score + larger_data_set_score ) / 5
 
     return {
         'score': score,
