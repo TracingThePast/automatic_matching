@@ -11,7 +11,7 @@ from pyxdameraulevenshtein import damerau_levenshtein_distance, normalized_damer
 from rapidfuzz import fuzz
 from doublemetaphone import doublemetaphone
 
-AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.4"
+AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.5"
 
 DATE_COMPARISON_BY_TIMEDELTA_MAX_NUMBER_OF_DAYS = 4
 
@@ -74,6 +74,11 @@ year_weights = np.array([
     0,
     0.75,
 ])
+
+TTP_MATCHING_DEFAULT_DISREGARD_VALUES = {
+    'forenames': ['Israel', 'Sarah', 'Sara'],
+    'birth_place': ['Deutsches', 'Reich']
+}
 
 def get_date_sequences(date):
     normalized_year = number_normalization_for_common_ocr_mistakes(date['year'])
@@ -471,7 +476,7 @@ def get_names_as_list_flattend(values, is_surname = False):
             result.append(orig_val)
     return ', '.join(result)
 
-def match_against_local_data(local_data, external_data, potential_shortform = False):
+def match_against_local_data(local_data, external_data, disregard_data_set={}, potential_shortform = False):
     '''
         Takes two lists of local and external values and compares them.
         Returns a value between -1 (no match) and 1 (perfect match), following a cosine function.
@@ -481,6 +486,7 @@ def match_against_local_data(local_data, external_data, potential_shortform = Fa
     larger_data_set_label = 'external'
     smaller_data_set = local_data
     smaller_data_set_label = 'local'
+    score = 0
     if len(local_data) > len(external_data):
         larger_data_set = local_data
         larger_data_set_label = 'local'
@@ -491,6 +497,8 @@ def match_against_local_data(local_data, external_data, potential_shortform = Fa
     names_in_larger_set_original = {}
     names_in_smaller_set_normalized = {}
     names_in_smaller_set_original = {}
+    names_in_disregard_set_normalized = {}
+    names_in_disregard_set_original = {}
     for larger in larger_data_set:
         names_in_larger_set_normalized[larger] = []
         for key in larger_data_set[larger]:
@@ -499,6 +507,23 @@ def match_against_local_data(local_data, external_data, potential_shortform = Fa
         names_in_smaller_set_normalized[smaller] = []
         for key in smaller_data_set[smaller]:
             names_in_smaller_set_original[key] = []
+
+    names_matching_disregard_value_in_smaller_set_normalized = 0
+    names_matching_disregard_value_in_smaller_set_original = 0
+    names_matching_disregard_value_in_larger_set_normalized = 0
+    names_matching_disregard_value_in_larger_set_original = 0
+    for disregard in disregard_data_set:
+        names_in_disregard_set_normalized[disregard] = []
+        if disregard in names_in_smaller_set_normalized:
+            names_matching_disregard_value_in_smaller_set_normalized += 1
+        if disregard in names_in_larger_set_normalized:
+            names_matching_disregard_value_in_larger_set_normalized += 1
+        for key in disregard_data_set[disregard]:
+            names_in_disregard_set_original[key] = []
+            if key in names_in_smaller_set_original:
+                names_matching_disregard_value_in_smaller_set_original += 1
+            if key in names_in_larger_set_original:
+                names_matching_disregard_value_in_larger_set_original += 1
         
     for larger_original in names_in_larger_set_original:
         damerau_levenshtein_distance_sequences = damerau_levenshtein_distance_seqs(larger_original, list(names_in_smaller_set_original.keys()))
@@ -569,16 +594,36 @@ def match_against_local_data(local_data, external_data, potential_shortform = Fa
     smaller_original_data_set_scores = []
     larger_original_data_set_scores = []
 
+
+    names_in_disregard_set_normalized_len = len(names_in_disregard_set_normalized)
+    names_in_disregard_set_original_len = len(names_in_disregard_set_original)
+    
+    names_in_smaller_set_normalized_len = len(names_in_smaller_set_normalized)
     for smaller in names_in_smaller_set_normalized:
+        if names_in_disregard_set_normalized_len > 0 and names_matching_disregard_value_in_smaller_set_normalized < names_in_smaller_set_normalized_len:
+            if smaller in names_in_disregard_set_normalized and names_in_smaller_set_normalized[smaller] > 0.001:
+                continue
         smaller_data_set_scores.append(names_in_smaller_set_normalized[smaller])
 
+    names_in_larger_set_normalized_len = len(names_in_larger_set_normalized)
     for larger in names_in_larger_set_normalized:
+        if names_in_disregard_set_normalized_len > 0 and names_matching_disregard_value_in_larger_set_normalized < names_in_larger_set_normalized_len:
+            if larger in names_in_disregard_set_normalized and names_in_larger_set_normalized[larger] > 0.001:
+                continue
         larger_data_set_scores.append(names_in_larger_set_normalized[larger])
 
+    names_in_smaller_set_original_len = len(names_in_smaller_set_original)
     for smaller_original in names_in_smaller_set_original:
+        if names_in_disregard_set_original_len > 0 and names_matching_disregard_value_in_smaller_set_original < names_in_smaller_set_original_len:
+            if smaller_original in names_in_disregard_set_original and names_in_smaller_set_original[smaller_original] > 0.001:
+                continue
         smaller_original_data_set_scores.append(names_in_smaller_set_original[smaller_original])
 
+    names_in_larger_set_original_len = len(names_in_larger_set_original)
     for larger_original in names_in_larger_set_original:
+        if names_in_disregard_set_original_len > 0 and names_matching_disregard_value_in_larger_set_original < names_in_larger_set_original_len:
+            if larger_original in names_in_disregard_set_original and names_in_larger_set_original[larger_original] > 0.001:
+                continue
         larger_original_data_set_scores.append(names_in_larger_set_original[larger_original])
 
     smaller_data_set_scores.sort()
@@ -587,13 +632,19 @@ def match_against_local_data(local_data, external_data, potential_shortform = Fa
 
     smaller_data_set_score = np.cos(np.pi * (8 * np.mean(smaller_data_set_scores) + 4 * max(smaller_data_set_scores) + 2 * np.mean(smaller_original_data_set_scores) + max(smaller_original_data_set_scores)) / 15)
     larger_data_set_score = np.cos(np.pi * (8 * np.mean(larger_data_set_scores) + 4 * max(larger_data_set_scores) + 2 * np.mean(larger_original_data_set_scores) + max(larger_original_data_set_scores)) / 15)
-    score = (smaller_data_set_score + larger_data_set_score ) / 2
-    
+
+    length_difference_smaller_to_larger_score_set =  len(larger_data_set_scores) - len(smaller_data_set_scores)
+
+    if len(local_data) == len(external_data):
+        score = (smaller_data_set_score + larger_data_set_score ) / 2
+    else:
+        score = (2*smaller_data_set_score + larger_data_set_score ) / 3
 
     return {
         'score': score,
         'smaller_data_set_score': smaller_data_set_score,
         'larger_data_set_score': larger_data_set_score,
+        'difference_in_length': length_difference_smaller_to_larger_score_set,
         f'{smaller_data_set_label}_score': smaller_data_set_score,
         f'{larger_data_set_label}_score': larger_data_set_score,
         smaller_data_set_label: names_in_smaller_set_normalized,
@@ -698,7 +749,7 @@ MIN_TOTAL_SCORE_FOR_MATCH_WITH_PERFECT_RELATIVE_SCORE = 50
 TOTAL_MAX_SCORE_REACHABLE = FORENAME_MAX_SCORE_CONTRIBUTION + SURNAME_MAX_SCORE_CONTRIBUTION + BIRTH_PLACE_MAX_SCORE_CONTRIBUTION + BIRTH_DATE_MAX_SCORE_CONTRIBUTION + DEATH_PLACE_MAX_SCORE_CONTRIBUTION + DEATH_DATE_MAX_SCORE_CONTRIBUTION
 
 
-def get_matching_score(local_data_set, external_data_set):
+def get_matching_score(local_data_set, external_data_set, values_to_be_disregarded={}):
     '''
         Expected inputs: local_data_set and external_data_set:
         To get a complete match all values have to be provided.
@@ -724,6 +775,7 @@ def get_matching_score(local_data_set, external_data_set):
     # NAME information
     local_forenames = {}
     external_forenames = {}
+    disregard_forenames = {}
     forename_results = {}
     if 'forenames' in local_data_set:
         local_forenames = get_names_as_dict(local_data_set['forenames'], False)
@@ -733,8 +785,12 @@ def get_matching_score(local_data_set, external_data_set):
         external_forenames = get_names_as_dict(external_data_set['forenames'], False)
         forename_results['external'] = external_forenames
 
+    if 'forenames' in values_to_be_disregarded:
+        disregard_forenames = get_names_as_dict(values_to_be_disregarded['forenames'], False)
+        forename_results['disregard'] = disregard_forenames
+
     if len(local_forenames) > 0 and len(external_forenames) > 0:
-        forename_results = match_against_local_data(local_forenames, external_forenames, True)
+        forename_results = match_against_local_data(local_forenames, external_forenames, disregard_forenames, True)
 
         forename_score = forename_results['score'] * FORENAME_MAX_SCORE_CONTRIBUTION
         max_score_reachable += FORENAME_MAX_SCORE_CONTRIBUTION
@@ -750,6 +806,7 @@ def get_matching_score(local_data_set, external_data_set):
 
     local_surnames = {}
     external_surnames = {}
+    disregard_surnames = {}
     surname_results = {}
     if 'surnames' in local_data_set:
         local_surnames = get_names_as_dict(local_data_set['surnames'], True)
@@ -759,8 +816,12 @@ def get_matching_score(local_data_set, external_data_set):
         external_surnames = get_names_as_dict(external_data_set['surnames'], True)
         surname_results['external'] = external_surnames
 
+    if 'surnames' in values_to_be_disregarded:
+        disregard_surnames = get_names_as_dict(values_to_be_disregarded['surnames'], True)
+        surname_results['disregard'] = disregard_surnames
+
     if len(local_surnames) > 0 and len(external_surnames) > 0:
-        surname_results = match_against_local_data(local_surnames, external_surnames, False)
+        surname_results = match_against_local_data(local_surnames, external_surnames, disregard_surnames, False)
 
         surname_score = surname_results['score'] * SURNAME_MAX_SCORE_CONTRIBUTION
         max_score_reachable += SURNAME_MAX_SCORE_CONTRIBUTION
@@ -779,6 +840,7 @@ def get_matching_score(local_data_set, external_data_set):
     
     local_birth_place = {}
     external_birth_place = {}
+    disregard_birth_place = {}
     birth_place_results = {}
     if 'birth_place' in local_data_set:
         local_birth_place = get_names_as_dict(local_data_set['birth_place'], False)
@@ -788,8 +850,12 @@ def get_matching_score(local_data_set, external_data_set):
         external_birth_place = get_names_as_dict(external_data_set['birth_place'], False)
         birth_place_results['external'] = external_birth_place
 
+    if 'birth_place' in values_to_be_disregarded:
+        disregard_birth_place = get_names_as_dict(values_to_be_disregarded['birth_place'], False)
+        birth_place_results['disregard'] = disregard_birth_place
+
     if len(local_birth_place) > 0 and len(external_birth_place) > 0:
-        birth_place_results = match_against_local_data(local_birth_place, external_birth_place, True)
+        birth_place_results = match_against_local_data(local_birth_place, external_birth_place, disregard_birth_place, True)
 
         birth_place_results['score'] = birth_place_results['smaller_data_set_score'] # Override the combined score with the one for the smaller data set only (As the place formating might differ to a great extend)
 
@@ -837,6 +903,7 @@ def get_matching_score(local_data_set, external_data_set):
 
     local_death_place = {}
     external_death_place = {}
+    disregard_death_place = {}
     death_place_results = {}
     if 'death_place' in local_data_set:
         local_death_place = get_names_as_dict(local_data_set['death_place'], False)
@@ -846,9 +913,13 @@ def get_matching_score(local_data_set, external_data_set):
         external_death_place = get_names_as_dict(external_data_set['death_place'], False)
         death_place_results['external'] = external_death_place
 
+    if 'death_place' in values_to_be_disregarded:
+        disregard_death_place = get_names_as_dict(values_to_be_disregarded['death_place'], False)
+        death_place_results['disregard'] = disregard_death_place
+
     if len(local_death_place) > 0 and len(external_death_place) > 0:
 
-        death_place_results = match_against_local_data(local_death_place, external_death_place, True)
+        death_place_results = match_against_local_data(local_death_place, external_death_place, disregard_death_place, True)
 
         death_place_results['score'] = death_place_results['smaller_data_set_score']
         death_place_score = death_place_results['score'] * DEATH_PLACE_MAX_SCORE_CONTRIBUTION
