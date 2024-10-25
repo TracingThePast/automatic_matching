@@ -446,9 +446,17 @@ def get_doublemetaphone_matching_score(val_1, val_2, potential_shortform = False
     
     return 1 - metaphone_sim
 
+
+def split_string_values(value):
+    val = value.replace('(', '').replace(')', '').replace(':', '')
+    return list(filter(None, re.split('; |, |/ | ', val)))
+
 def get_names_as_dict(names, is_surname=False, remove_acronyms=True):
     result = {}
+    names_split = []
     for name in names:
+        names_split += split_string_values(name)
+    for name in names_split:
         name_length = len(name)
         if remove_acronyms:
             if name_length == 1:
@@ -461,10 +469,6 @@ def get_names_as_dict(names, is_surname=False, remove_acronyms=True):
                 result[normalized_value] = []
             result[normalized_value].append(name)
     return result
-
-def split_string_values(value):
-    val = value.replace('(', '').replace(')', '').replace(':', '')
-    return list(filter(None, re.split('; |, |/ | ', val)))
 
 
 def get_names_as_list_flattend(values, is_surname = False):
