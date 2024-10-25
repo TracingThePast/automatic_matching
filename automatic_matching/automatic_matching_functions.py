@@ -449,7 +449,7 @@ def get_doublemetaphone_matching_score(val_1, val_2, potential_shortform = False
 
 def split_string_values(value):
     val = value.replace('(', '').replace(')', '').replace(':', '')
-    return list(filter(None, re.split('; |, |/ | -', val)))
+    return list(filter(None, re.split('; |, |/ |-| ', val)))
 
 def get_names_as_dict(names, is_surname=False, remove_acronyms=True):
     result = {}
