@@ -11,7 +11,7 @@ from pyxdameraulevenshtein import damerau_levenshtein_distance, normalized_damer
 from rapidfuzz import fuzz
 from doublemetaphone import doublemetaphone
 
-AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.6"
+AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.7"
 
 DATE_COMPARISON_BY_TIMEDELTA_MAX_NUMBER_OF_DAYS = 4
 
