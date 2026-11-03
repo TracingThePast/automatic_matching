@@ -1,6 +1,6 @@
 """Regression tests that lock the vendored matching engine's contract.
 
-The engine (algorithm v2.9) is the heart of the product; these tests pin its
+The engine (algorithm v3.0) is the heart of the product; these tests pin its
 behaviour so it cannot drift silently. They are plain ``unittest`` cases (no
 Django required) and run either via::
 
@@ -72,8 +72,8 @@ class ScoreContractTests(unittest.TestCase):
 
     def test_algorithm_version_is_reported(self):
         result = get_matching_score(COMPLETE_PERSON, COMPLETE_PERSON)
-        self.assertEqual(result['matching_algorithm_version'], '2.9')
-        self.assertEqual(AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING, '2.9')
+        self.assertEqual(result['matching_algorithm_version'], '3.0')
+        self.assertEqual(AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING, '3.0')
 
     def test_identical_complete_record_is_a_perfect_match(self):
         result = get_matching_score(COMPLETE_PERSON, COMPLETE_PERSON)

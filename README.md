@@ -23,7 +23,7 @@ MIT licensed.
 ## Install
 
 ```bash
-pip install git+https://github.com/TracingThePast/automatic_matching@v3.0.0
+pip install git+https://github.com/TracingThePast/automatic_matching@3.0
 ```
 
 PyICU needs the system ICU development libraries at build time (e.g.

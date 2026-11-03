@@ -11,7 +11,7 @@ from pyxdameraulevenshtein import damerau_levenshtein_distance, normalized_damer
 from rapidfuzz import fuzz
 from doublemetaphone import doublemetaphone
 
-AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.9"
+AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "3.0"
 
 DATE_COMPARISON_BY_TIMEDELTA_MAX_NUMBER_OF_DAYS = 4
 # An imprecise date (a **-wildcard, an open-ended </> bound, or any multi-day
