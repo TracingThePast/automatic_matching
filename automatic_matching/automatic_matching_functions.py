@@ -11,9 +11,58 @@ from pyxdameraulevenshtein import damerau_levenshtein_distance, normalized_damer
 from rapidfuzz import fuzz
 from doublemetaphone import doublemetaphone
 
-AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "2.7"
+AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING = "3.0"
 
 DATE_COMPARISON_BY_TIMEDELTA_MAX_NUMBER_OF_DAYS = 4
+# An imprecise date (a **-wildcard, an open-ended </> bound, or any multi-day
+# range) that OVERLAPS the other side is a MODERATE partial match — the same score
+# whichever side is 'local'. ~+0.5 on the [-1, 1] date scale (so +10 of the 20
+# birth-date points), matching a same-year/different-day agreement: a real full
+# date always outweighs a wildcard, and it never flips to a conflict by direction.
+DATE_IMPRECISE_PARTIAL_SCORE = 0.5
+
+# -- Corroborating signals --------------------------------------------------
+# Distinctive, NON-identity data points (a prisoner number, a former address, an
+# imprisonment place) that the six-field identity score never looks at. On a NEAR
+# MISS they can tip a pair over the line: positive-only (they only ever ADD), and
+# evaluated only when the identity score is already close. Declarative so the set
+# is editable without touching the arithmetic; see ``corroborating_boost``.
+#
+# Each signal:
+#   field         key read from each side's data set (mirrors provided_additional_data)
+#   compare       'number' (OCR-tolerant near-exact digits) | 'place' (string/phonetic)
+#   boost         points added when the field matches on both sides
+#   require_match optional guard fields that, IF present on both sides, must ALSO
+#                 match for the boost to apply (a mismatch WITHHOLDS the boost — it
+#                 is never a penalty). A guard is a bare field name (compared as a
+#                 place) or a {'field', 'compare'} dict.
+CORROBORATING_SIGNALS = (
+    {
+        'field': 'prisoner_number',
+        'compare': 'number',
+        # Tiered: a reused number + matching name but NO date to verify is only a weak
+        # tip (+5, won't auto-merge a names-only pair on its own); the full +10 applies
+        # only when a birth date ALSO agrees within tolerance (``corroborated_by``).
+        'boost': 5,
+        'boost_corroborated': 10,
+        'corroborated_by': 'birth_date',
+        # Prisoner numbers were assigned PER CAMP and reused, so the same number can
+        # belong to two people in two camps — require the imprisonment place to agree
+        # when both records carry one.
+        'require_match': ('place_of_imprisonment',),
+        # A reused number only corroborates when the rest of the identity is a small
+        # OCR/spelling edit apart (Anna↔Hanna = 1, a one-digit year slip = 1, a month
+        # swap 04↔11 = 2) — withhold entirely when the name or date genuinely diverges.
+        'require_close': {'surname': 2, 'forename': 2, 'birth_date': 2},
+    },
+    {
+        'field': 'residence_place',
+        'compare': 'place',
+        'boost': 5,
+    },
+)
+# A place sub-score (cosine space, −1…1) at/above which two places "match".
+CORROBORATING_PLACE_MATCH_MIN = 0.5
 
 latin_transliterator = icu.Transliterator.createInstance('Any-Latin; Latin-ASCII;IPA-XSampa;NFD; [:Nonspacing Mark:] Remove; NFC; Lower();')
 # Creates a transliterator that replaces all non latin characters, removes all accents and lowercases the entire string.
@@ -276,11 +325,62 @@ def datetime_range_matches_date(thresholds, dates, external_range=False):
             
     return matches, non_matches
 
+def _date_bounds(converted):
+    """Each date on one side as an interval ``(lo, hi, precise, label)``. Full and
+    ``**``-fuzzy dates come from ``dates`` (their datetime span); open-ended
+    ``<``/``>`` come from ``thresholds``. ``precise`` is True only for a single-day
+    span (a full date) — everything wider is imprecise."""
+    bounds = []
+    for d in converted.get('dates', []):
+        lo, hi = d.get('datetime_from'), d.get('datetime_to')
+        if lo and hi:
+            label = f"{d['year_sequences'][0]}-{d['month_day_sequences'][0]}"
+            bounds.append((lo, hi, (hi - lo).days <= 1, label))
+    thresholds = converted.get('thresholds') or {}
+    if thresholds:
+        lo = thresholds.get('min', datetime.datetime.min)
+        hi = thresholds.get('max', datetime.datetime.max)
+        bounds.append((lo, hi, False, daterange_as_string(thresholds.get('min'), thresholds.get('max'))))
+    return bounds
+
+
 def match_date_against_local_date(local_dates, external_dates):
     scores = []
     result = {}
     converted_local_dates = convert_dates(local_dates)
     converted_external_dates = convert_dates(external_dates)
+
+    # Symmetric handling of imprecise dates. When an interval on either side is
+    # imprecise (a **-wildcard, a </> bound, or a multi-day range), it is treated as
+    # a RANGE — scored the same whichever side is 'local', fixing the old
+    # order-dependent scoring that rated a wildcard-vs-full pair a strong match one
+    # way and a conflict the other:
+    #   · the ranges OVERLAP  → MODERATE partial (the dates are compatible, but the
+    #     imprecise side pins nothing down), so a real full date still outscores it;
+    #   · the ranges are DISJOINT → conflict (the known parts disagree, e.g. 1925 vs
+    #     a 1926 wildcard).
+    # Two precise dates are left to the graded scoring below (exact day → strong
+    # match; nearby days → partial), so full-date behaviour is unchanged.
+    local_bounds = _date_bounds(converted_local_dates)
+    external_bounds = _date_bounds(converted_external_dates)
+    precise_exact = False
+    imprecise_result = None  # best-scoring imprecise pair
+    for lo_l, hi_l, prec_l, lbl_l in local_bounds:
+        for lo_e, hi_e, prec_e, lbl_e in external_bounds:
+            # Upper bounds are EXCLUSIVE (a year wildcard's datetime_to is next-Jan-1,
+            # a full date's is 23:59 the same day), so overlap is a STRICT inequality:
+            # adjacent ranges that merely touch at the boundary (1912-**-** ending
+            # 1913-01-01 vs 1913-**-** starting 1913-01-01) must NOT count as overlap.
+            overlaps = lo_l < hi_e and lo_e < hi_l
+            if prec_l and prec_e:
+                precise_exact = precise_exact or overlaps
+                continue
+            score = DATE_IMPRECISE_PARTIAL_SCORE if overlaps else -1.0
+            if imprecise_result is None or score > imprecise_result['score']:
+                imprecise_result = {'local': lbl_l, 'external': lbl_e, 'score': score}
+    if not precise_exact and imprecise_result is not None:
+        return imprecise_result
+
     converted_local_dates_thresholds_len = len(converted_local_dates['thresholds'])
     converted_external_dates_thresholds_len = len(converted_external_dates['thresholds'])
 
@@ -451,6 +551,55 @@ def split_string_values(value):
     val = value.replace('(', '').replace(')', '').replace(':', '')
     return list(filter(None, re.split('; |, |/ |-| ', val)))
 
+# Nobiliary / toponymic surname particles (articles + prepositions) across the
+# European languages the persecutees came from. Short and ubiquitous, they
+# collide phonetically with real name stems (the "Veen" ↔ "Van" false match), so
+# they are dropped from the phonetic comparison. Patronymic prefixes (Mac, Mc,
+# O', ap, ab, bin, ibn, ben) are deliberately NOT here — they are part of the
+# surname, not droppable. Single-character particles (y, e, i, z, d', 't) are
+# already removed by the engine's acronym filter.
+_SURNAME_PARTICLES_RAW = [
+    # German / Austrian / Swiss / Luxembourgish
+    'von', 'vom', 'zu', 'zur', 'zum', 'am', 'an', 'im', 'in', 'aus', 'auf', 'unter', 'ob', 'vor', 'zer',
+    # Dutch / Flemish / Afrikaans (tussenvoegsels)
+    'van', 'ver', 'den', 'der', 'des', 'ten', 'ter', 'te', 'het', 'op', 'aan', 'uit', 'uijt', 'onder',
+    'over', 'voor', 'bij', 'tot', 'thoe',
+    # French / Walloon
+    'de', 'du', 'des', 'le', 'la', 'les',
+    # Italian
+    'di', 'da', 'del', 'dello', 'della', 'delle', 'dei', 'degli',
+    'dal', 'dallo', 'dalla', 'dalle', 'dai', 'dagli', 'lo', 'li',
+    # Spanish / Catalan
+    'las', 'los', 'dels',
+    # Portuguese / Galician
+    'do', 'dos', 'das',
+    # Scandinavian
+    'af', 'av',
+    # West-Slavic nobiliary ("of")
+    'ze',
+]
+_SURNAME_PARTICLE_KEYS = frozenset(normalize_string(p, True).lower() for p in _SURNAME_PARTICLES_RAW)
+
+
+def _demote_surname_particles(result):
+    """Drop nobiliary particles from the NORMALISED surname keys (so they no
+    longer contribute to the phonetic comparison — "van Klaveren" is matched on
+    "Klaveren"), while re-filing their originals under a surviving stem so the
+    exact/original layer still sees the full surname and can penalise a
+    particle that is present in one record but not the other. Left untouched when
+    the surname is *only* particles (nothing to demote onto)."""
+    particle_keys = [k for k in result if k.lower() in _SURNAME_PARTICLE_KEYS]
+    if not particle_keys:
+        return result
+    survivors = [k for k in result if k.lower() not in _SURNAME_PARTICLE_KEYS]
+    if not survivors:
+        return result
+    sink = survivors[0]
+    for key in particle_keys:
+        result[sink].extend(result.pop(key))
+    return result
+
+
 def get_names_as_dict(names, is_surname=False, remove_acronyms=True):
     result = {}
     names_split = []
@@ -468,6 +617,8 @@ def get_names_as_dict(names, is_surname=False, remove_acronyms=True):
             if normalized_value not in result:
                 result[normalized_value] = []
             result[normalized_value].append(name)
+    if is_surname:
+        result = _demote_surname_particles(result)
     return result
 
 
@@ -753,7 +904,8 @@ MIN_TOTAL_SCORE_FOR_MATCH_WITH_PERFECT_RELATIVE_SCORE = 50
 TOTAL_MAX_SCORE_REACHABLE = FORENAME_MAX_SCORE_CONTRIBUTION + SURNAME_MAX_SCORE_CONTRIBUTION + BIRTH_PLACE_MAX_SCORE_CONTRIBUTION + BIRTH_DATE_MAX_SCORE_CONTRIBUTION + DEATH_PLACE_MAX_SCORE_CONTRIBUTION + DEATH_DATE_MAX_SCORE_CONTRIBUTION
 
 
-def get_matching_score(local_data_set, external_data_set, values_to_be_disregarded={}):
+def get_matching_score(local_data_set, external_data_set, values_to_be_disregarded={}, *,
+                        with_edit_distances=False):
     '''
         Expected inputs: local_data_set and external_data_set:
         To get a complete match all values have to be provided.
@@ -972,15 +1124,285 @@ def get_matching_score(local_data_set, external_data_set, values_to_be_disregard
     if total_relative_score == 1 and absolute_score >= MIN_TOTAL_SCORE_FOR_MATCH_WITH_PERFECT_RELATIVE_SCORE:
         automatically_matched = True
     
-    return {
+    result = {
         **results,
         'absolute_score': absolute_score,
         'relative_score': relative_score,
         'total_relative_score': total_relative_score,
         'max_score_reachable': max_score_reachable,
         'automatically_matched': bool(automatically_matched),
-        'matching_algorithm_version': AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING
+        'matching_algorithm_version': AUTOMATIC_MATCHING_ALGORITHM_VERSION_STRING,
     }
+    # The edit-distance readout re-runs name normalisation (icu), so it is opt-in: the
+    # hot scoring path leaves it off; the staff explanation (and the near-miss gate, via
+    # corroborating_boost) turn it on only where consumed. See docs/corroborating-signals.md.
+    if with_edit_distances:
+        result['edit_distances'] = _edit_distances(local_data_set, external_data_set)
+    return result
+
+
+# -- edit-distance readouts -------------------------------------------------
+# How far apart the two records' names / dates are AFTER the engine's own
+# normalisation — the residual spelling/OCR edits. Surfaced on every result so a
+# reviewer (and the corroborating-signal gate) can see whether a near miss is "one
+# typo away" (Anna↔Hanna = 1; a one-digit year slip 1914↔1904 = 1; a month swap
+# 04↔11 = 2) or genuinely different.
+
+def _edit_name_tokens(values, is_surname=False):
+    tokens = []
+    for value in values or []:
+        for token in split_string_values(value):
+            norm = normalize_string(token, is_surname)
+            if norm:
+                tokens.append(norm)
+    return tokens
+
+
+def name_edit_distance(local_values, external_values, is_surname=False):
+    """Smallest Damerau–Levenshtein distance between any local and external name
+    token, on the engine-normalised forms (so it counts the spelling edits that
+    remain once transliteration/folding is applied). ``None`` when either side has
+    no name token."""
+    local = _edit_name_tokens(local_values, is_surname)
+    external = _edit_name_tokens(external_values, is_surname)
+    if not local or not external:
+        return None
+    return min(damerau_levenshtein_distance(a, b) for a in local for b in external)
+
+
+def _date_digit_cells(date):
+    """A date string ('YYYY-MM-DD', possibly with ** wildcards or a </> bound) as 8
+    cells (YYYYMMDD); each cell is its digit, or ``None`` when unknown/wildcard. For
+    an open bound (< or >) only the year is meaningful — the month/day are sentinels,
+    so they are treated as unknown."""
+    raw = str(date or '').strip()
+    open_bound = raw[:1] in ('<', '>')
+    text = raw.lstrip('<>').strip()
+    cells = []
+    for i, (part, width) in enumerate(zip(text.split('-'), (4, 2, 2))):
+        chars = list(part)[:width]
+        chars += ['?'] * (width - len(chars))
+        for ch in chars:
+            cells.append(None if (open_bound and i > 0) else (ch if ch.isdigit() else None))
+    cells += [None] * (8 - len(cells))
+    return cells[:8]
+
+
+def _edit_distances(local_data_set, external_data_set):
+    """The full readout: name (forename/surname) + birth-date edit distances."""
+    return {
+        'forename': name_edit_distance(local_data_set.get('forenames'), external_data_set.get('forenames'), False),
+        'surname': name_edit_distance(local_data_set.get('surnames'), external_data_set.get('surnames'), True),
+        'birth_date': date_edit_distance(local_data_set.get('birth_date'), external_data_set.get('birth_date')),
+    }
+
+
+def date_edit_distance(local_dates, external_dates):
+    """Fewest differing digits between the closest pair of dates, over positions
+    known on BOTH sides (wildcards / open bounds don't count). A one-digit year slip
+    (1914↔1904) = 1, a month swap (04↔11) = 2, a wholly different date is large.
+    ``None`` when a date is missing on either side or nothing is comparable."""
+    if not local_dates or not external_dates:
+        return None
+    best = None
+    for da in local_dates:
+        ca = _date_digit_cells(da)
+        for db in external_dates:
+            cb = _date_digit_cells(db)
+            pairs = [(x, y) for x, y in zip(ca, cb) if x is not None and y is not None]
+            if not pairs:
+                continue
+            diffs = sum(1 for x, y in pairs if x != y)
+            best = diffs if best is None else min(best, diffs)
+    return best
+
+
+def corroborating_signal_fields(signals=CORROBORATING_SIGNALS):
+    """Every data-set key the signals read (signal fields + guard fields), in order,
+    de-duplicated — the set the data-set builders and ES routine must carry."""
+    keys = []
+    for signal in signals or ():
+        candidates = [signal.get('field')]
+        for guard in signal.get('require_match', ()):
+            candidates.append(guard if isinstance(guard, str) else guard.get('field'))
+        for key in candidates:
+            if key and key not in keys:
+                keys.append(key)
+    return tuple(keys)
+
+
+def _corroborating_values(data_set, field):
+    """Normalise a data-set entry to a list of non-empty strings (the fields may be
+    scalars from ``provided_additional_data`` or already lists)."""
+    value = data_set.get(field)
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _corroborating_number_signature(value):
+    """Digits only, with the engine's common OCR digit folding applied, so OCR
+    confusions (notably 7↔1) don't split an otherwise-identical number. Empty when
+    the value holds no digits."""
+    digits = re.sub(r'\D', '', str(value or ''))
+    return number_normalization_for_common_ocr_mistakes(digits) if digits else ''
+
+
+def _corroborating_place_similarity(local_value, external_value):
+    """The engine's own place similarity (−1…1) between two single place strings."""
+    local = get_names_as_dict([local_value], False)
+    external = get_names_as_dict([external_value], False)
+    if not local or not external:
+        return -1.0
+    result = match_against_local_data(local, external, {}, True)
+    return result.get('smaller_data_set_score', result.get('score', -1.0))
+
+
+def _corroborating_field_match(compare, local_values, external_values, place_match_min):
+    """``(present_on_both, matched)`` for one field. ``present_on_both`` is True only
+    when each side carries a value; ``matched`` says whether any pair agrees."""
+    if not local_values or not external_values:
+        return (False, False)
+    if compare == 'number':
+        signatures = {_corroborating_number_signature(v) for v in local_values}
+        signatures.discard('')
+        matched = any(
+            _corroborating_number_signature(v) in signatures
+            for v in external_values if _corroborating_number_signature(v)
+        )
+        return (True, matched)
+    # place-style
+    best = max(
+        (_corroborating_place_similarity(a, b) for a in local_values for b in external_values),
+        default=-1.0,
+    )
+    return (True, best >= place_match_min)
+
+
+def corroborating_boost(result, local_data_set, external_data_set, *,
+                        near_miss_min, near_miss_max,
+                        signals=CORROBORATING_SIGNALS,
+                        place_match_min=CORROBORATING_PLACE_MATCH_MIN,
+                        cap=None):
+    """Positive-only corroboration, applied ONLY when ``result``'s ``absolute_score``
+    is a near miss (``near_miss_min`` <= score < ``near_miss_max``).
+
+    For each configured signal whose field matches on both records — and whose
+    ``require_match`` guards all pass and ``require_close`` edit-distance limits hold —
+    the signal's ``boost`` is added to the score. A guard present on both sides that
+    DISAGREES withholds that signal's boost (never a penalty); a guard missing on
+    either side is inconclusive and does not block. ``require_close`` {field: max}
+    additionally withholds the boost when a residual name/date edit distance exceeds
+    its limit (so a reused identifier can't merge genuinely different identities).
+    The applied boost and a per-signal breakdown are recorded on ``result``
+    (``corroborating_boost`` / ``corroborating_signals``) so a rescued match stays
+    explainable. Outside the near-miss band, or with nothing matching, ``result`` is
+    returned unchanged.
+
+    This is an SR-level adjustment layered on the engine's identity arithmetic — like
+    the forename-variant credit and the confirmed-individual birth-date penalty — kept
+    here so it ships with the published algorithm. The near-miss band must be judged
+    AFTER those adjustments, so the caller (not the engine's own scorer) supplies it.
+    """
+    score = result.get('absolute_score', 0) or 0
+    if not (near_miss_min <= score < near_miss_max) or not signals:
+        return result
+
+    def edits():
+        # Just-in-time, memoised. Reuses the readout if the caller already asked for it
+        # (with_edit_distances=True); otherwise computes once, here on a near-miss pair
+        # that reached the gate — the only place the hot path needs edit distances.
+        e = result.get('edit_distances')
+        if e is None:
+            e = _edit_distances(local_data_set, external_data_set)
+            result['edit_distances'] = e
+        return e
+
+    applied = []
+    total = 0.0
+    for signal in signals:
+        field = signal['field']
+        boost = signal.get('boost', 0) or 0
+        if boost <= 0:
+            continue
+        present, matched = _corroborating_field_match(
+            signal.get('compare', 'place'),
+            _corroborating_values(local_data_set, field),
+            _corroborating_values(external_data_set, field),
+            place_match_min,
+        )
+        if not (present and matched):
+            continue
+
+        guards = {}
+        withheld = False
+        for guard in signal.get('require_match', ()):
+            g_field = guard if isinstance(guard, str) else guard.get('field')
+            g_compare = 'place' if isinstance(guard, str) else guard.get('compare', 'place')
+            g_present, g_matched = _corroborating_field_match(
+                g_compare,
+                _corroborating_values(local_data_set, g_field),
+                _corroborating_values(external_data_set, g_field),
+                place_match_min,
+            )
+            if not g_present:
+                guards[g_field] = 'absent'
+            elif g_matched:
+                guards[g_field] = 'match'
+            else:
+                guards[g_field] = 'conflict'
+                withheld = True
+        if withheld:
+            continue
+
+        # Edit-distance gate: an identifier (e.g. a reused prisoner number) only
+        # corroborates when the rest of the identity is a small spelling/OCR edit
+        # apart — not when the names/dates genuinely diverge. For each field named in
+        # ``require_close`` with a readout present (both sides had a value), the edit
+        # distance must be within the limit, else the boost is withheld. A missing
+        # readout (field absent on a side) is inconclusive and does not block.
+        close = {}
+        too_far = False
+        for cfield, limit in (signal.get('require_close') or {}).items():
+            dist = edits().get(cfield)
+            if dist is None:
+                continue
+            close[cfield] = dist
+            if dist > limit:
+                too_far = True
+        if too_far:
+            continue
+
+        # Tiered boost: a reused identifier on its own (names only) is a weak tip; the
+        # full ``boost_corroborated`` applies only when an independent identity field
+        # (``corroborated_by``, e.g. birth_date) is ALSO present on both sides — and,
+        # having passed ``require_close`` above, is therefore within tolerance. Absent
+        # that corroboration the base ``boost`` applies.
+        amount = boost
+        corroborated_by = signal.get('corroborated_by')
+        if (corroborated_by and signal.get('boost_corroborated')
+                and edits().get(corroborated_by) is not None):
+            amount = signal['boost_corroborated']
+
+        total += amount
+        applied.append({'field': field, 'boost': amount, 'guards': guards,
+                        'edits': close, 'corroborated': amount != boost})
+
+    if total <= 0:
+        return result
+    if cap is not None:
+        total = min(total, cap)
+
+    result['absolute_score'] = score + total
+    result['corroborating_boost'] = total
+    result['corroborating_signals'] = applied
+    max_reachable = result.get('max_score_reachable', 0)
+    result['relative_score'] = (result['absolute_score'] / max_reachable) if max_reachable else result.get('relative_score', 0)
+    return result
+
 
 def convert_dict_to_string(values, total_score=None):
     result = ""
