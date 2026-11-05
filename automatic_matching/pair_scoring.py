@@ -36,7 +36,7 @@ __all__ = [
     'MatchingConfig', 'DEFAULT_CONFIG',
     'scored_pair',
     'field_conflict', 'surname_conflict', 'place_conflict', 'places_disjoint',
-    'place_tokens', 'identity_conflict', 'pair_is_match',
+    'place_tokens', 'identity_conflict', 'pair_is_match', 'pair_is_cohesive',
     'birth_date_conflict', 'apply_confirmed_birth_penalty',
     'single_confident_date', 'has_imprecise_birth_date', 'distinct_precise_dates',
     'strong_name', 'date_blocks_distinctive_attach', 'distinctive_name_target',
@@ -95,6 +95,14 @@ class MatchingConfig:
     distinctive_name_forename_min: float = 0.85
     distinctive_name_surname_min: float = 0.85
     distinctive_name_date_conflict_floor: float = 0.0
+
+    # Cluster-cohesion relative floor (0..1). A record may join a cluster past a
+    # member it cannot out-score on the ABSOLUTE scale — because that member carries
+    # little data, so the reachable score is small — as long as the pair agrees on
+    # (near) ALL the data they share: ``relative_score`` (achieved / max reachable)
+    # at or above this, with no conflicting field. Stops a low-information member from
+    # walling off a richer record it fully agrees with. See ``pair_is_cohesive``.
+    cohesion_relative_min: float = 0.9
 
 
 DEFAULT_CONFIG = MatchingConfig()
@@ -252,6 +260,34 @@ def pair_is_match(result, min_score, local=None, external=None, *, config=DEFAUL
     field (surname / birth place / death place) actively conflicts."""
     return ((result.get('absolute_score', 0) or 0) >= min_score
             and not identity_conflict(result, local, external, config=config))
+
+
+def pair_is_cohesive(result, min_score, local=None, external=None, *,
+                     min_relative=None, config=DEFAULT_CONFIG):
+    """Complete-linkage COHESION test — whether a record may sit in the same cluster
+    as one existing member. Like :func:`pair_is_match` it vetoes any outright identity
+    conflict (surname / birth place / death place).
+
+    But cohesion must not let a member that merely carries LITTLE data wall off a
+    richer record it fully agrees with: when the member is sparse the maximum
+    reachable score is small, so even a perfect agreement can fall below ``min_score``
+    through ABSENCE of data, not disagreement. So the pair also coheres when it agrees
+    on (near) all the data the two records share — ``relative_score`` (the achieved
+    score over the maximum reachable given the shared fields) at or above
+    ``min_relative`` (default :attr:`MatchingConfig.cohesion_relative_min`) — with no
+    conflicting field.
+
+    This is looser than ``pair_is_match`` ONLY on the absolute-vs-relative axis; a
+    surname/place conflict still vetoes, and a genuine field disagreement lowers the
+    relative score (the conflicting field is reachable yet scores low), so it does not
+    pass either."""
+    if identity_conflict(result, local, external, config=config):
+        return False
+    if (result.get('absolute_score', 0) or 0) >= min_score:
+        return True
+    if min_relative is None:
+        min_relative = config.cohesion_relative_min
+    return (result.get('relative_score', 0) or 0) >= min_relative
 
 
 def strong_name(forename_score, surname_score, *, config=DEFAULT_CONFIG):
