@@ -21,6 +21,7 @@ from automatic_matching.pair_scoring import (
     identity_conflict,
     nearest_pair,
     pair_is_match,
+    pair_is_cohesive,
     place_tokens,
     places_disjoint,
     scored_pair,
@@ -136,6 +137,33 @@ class PairIsMatchTests(unittest.TestCase):
 
     def test_missing_surname_and_place_still_matches_on_score(self):
         self.assertTrue(pair_is_match({'absolute_score': 65}, 60))
+
+
+class PairIsCohesiveTests(unittest.TestCase):
+    def test_clears_the_absolute_bar_like_pair_is_match(self):
+        self.assertTrue(pair_is_cohesive(
+            {'absolute_score': 70, 'relative_score': 0.7, 'surname': {'score': 0.9}}, 60))
+
+    def test_sparse_member_with_total_relative_agreement_coheres(self):
+        # Absolute 50 (< 60) only because the member is sparse (max reachable 50), but
+        # relative_score 1.0 — perfect agreement on the data they share. Coheres.
+        self.assertTrue(pair_is_cohesive(
+            {'absolute_score': 50, 'relative_score': 1.0, 'surname': {'score': 1.0}}, 60))
+
+    def test_low_relative_agreement_below_the_bar_does_not_cohere(self):
+        # Low absolute AND only partial agreement on shared data → not cohesive.
+        self.assertFalse(pair_is_cohesive(
+            {'absolute_score': 40, 'relative_score': 0.5, 'surname': {'score': 0.9}}, 60))
+
+    def test_surname_conflict_blocks_even_at_full_relative_agreement(self):
+        # A real conflict vetoes regardless of relative_score.
+        self.assertFalse(pair_is_cohesive(
+            {'absolute_score': 50, 'relative_score': 1.0, 'surname': {'score': 0.0}}, 60))
+
+    def test_relative_floor_is_configurable(self):
+        res = {'absolute_score': 50, 'relative_score': 0.85, 'surname': {'score': 1.0}}
+        self.assertFalse(pair_is_cohesive(res, 60))                       # default 0.9
+        self.assertTrue(pair_is_cohesive(res, 60, min_relative=0.8))      # loosened
 
 
 def _cids(birth, rt=1):
