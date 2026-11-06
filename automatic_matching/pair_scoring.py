@@ -20,6 +20,7 @@ reproduce the tuning the algorithm shipped with, and a caller overrides any of
 them (e.g. an application passing its own settings) without touching the code.
 """
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -37,6 +38,7 @@ __all__ = [
     'scored_pair',
     'field_conflict', 'surname_conflict', 'place_conflict', 'places_disjoint',
     'place_tokens', 'identity_conflict', 'pair_is_match', 'pair_is_cohesive',
+    'cluster_is_cohesive',
     'birth_date_conflict', 'apply_confirmed_birth_penalty',
     'single_confident_date', 'has_imprecise_birth_date', 'distinct_precise_dates',
     'strong_name', 'date_blocks_distinctive_attach', 'distinctive_name_target',
@@ -103,6 +105,14 @@ class MatchingConfig:
     # at or above this, with no conflicting field. Stops a low-information member from
     # walling off a richer record it fully agrees with. See ``pair_is_cohesive``.
     cohesion_relative_min: float = 0.9
+
+    # Cluster-cohesion quorum (0..1): the fraction of a cluster's members a record
+    # must POSITIVELY cohere with to join it (see ``cluster_is_cohesive``). Below 1.0
+    # this is a strong-majority rule rather than strict complete-linkage, so a single
+    # indeterminate member — no conflict, just under the bar (a sparse record, or a
+    # transcription variant the cluster itself also holds) — no longer walls off a
+    # record that agrees with the rest. A real conflict with ANY member still vetoes.
+    cohesion_quorum: float = 0.6
 
 
 DEFAULT_CONFIG = MatchingConfig()
@@ -288,6 +298,40 @@ def pair_is_cohesive(result, min_score, local=None, external=None, *,
     if min_relative is None:
         min_relative = config.cohesion_relative_min
     return (result.get('relative_score', 0) or 0) >= min_relative
+
+
+def cluster_is_cohesive(external, member_datasets, min_score, *, variant_index=None,
+                        min_relative=None, quorum=None, config=DEFAULT_CONFIG):
+    """Whether a record (``external`` data-set) may JOIN a cluster given its existing
+    members (``member_datasets``, each an engine data-set). Quorum cohesion, scoring
+    the record against each member's OWN data:
+
+    * a hard identity conflict (surname / birth place / death place) with ANY member
+      VETOES — this is the anti-chaining guard (a Veen ↔ … ↔ van Klaveren chain can
+      never form), and
+    * the record must POSITIVELY cohere (:func:`pair_is_cohesive`) with at least
+      ``quorum`` (a fraction, default :attr:`MatchingConfig.cohesion_quorum`) of the
+      members.
+
+    Members that neither conflict nor positively cohere — merely INDETERMINATE: no
+    conflict, but just under the bar (a sparse record, or a transcription variant the
+    cluster itself also holds) — are tolerated as the minority, so one of them cannot
+    wall off a record that clearly belongs to the rest. ``ceil`` keeps a 1- or
+    2-member cluster at full agreement. An empty cluster coheres trivially."""
+    members = list(member_datasets)
+    if not members:
+        return True
+    if quorum is None:
+        quorum = config.cohesion_quorum
+    cohere = 0
+    for member in members:
+        result = scored_pair(member, external, variant_index=variant_index, config=config)
+        if identity_conflict(result, member, external, config=config):
+            return False
+        if pair_is_cohesive(result, min_score, member, external,
+                            min_relative=min_relative, config=config):
+            cohere += 1
+    return cohere >= math.ceil(len(members) * quorum)
 
 
 def strong_name(forename_score, surname_score, *, config=DEFAULT_CONFIG):
