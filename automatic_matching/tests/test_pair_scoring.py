@@ -22,6 +22,7 @@ from automatic_matching.pair_scoring import (
     nearest_pair,
     pair_is_match,
     pair_is_cohesive,
+    cluster_is_cohesive,
     place_tokens,
     places_disjoint,
     scored_pair,
@@ -164,6 +165,46 @@ class PairIsCohesiveTests(unittest.TestCase):
         res = {'absolute_score': 50, 'relative_score': 0.85, 'surname': {'score': 1.0}}
         self.assertFalse(pair_is_cohesive(res, 60))                       # default 0.9
         self.assertTrue(pair_is_cohesive(res, 60, min_relative=0.8))      # loosened
+
+
+class ClusterIsCohesiveTests(unittest.TestCase):
+    """Quorum cohesion over a cluster's members (real scoring of the record against
+    each member's own data)."""
+
+    def _ds(self, fn='Osias', sn='Ehrenberg', bd=None, bp=None):
+        return {'forenames': [fn], 'surnames': [sn], 'birth_date': bd or [],
+                'birth_place': bp or [], 'death_date': [], 'death_place': []}
+
+    def test_majority_agreement_coheres_past_one_variant(self):
+        # Five members agree on the date; one carries the day/month-swapped variant
+        # (indeterminate — no conflict, just under the bar). The record still joins.
+        incoming = self._ds(bd=['1882-02-23'], bp=['Przemysl'])
+        members = [self._ds(bd=['1882-02-23'], bp=['Przemysl']) for _ in range(5)]
+        members.append(self._ds(bd=['1882-08-23']))
+        self.assertTrue(cluster_is_cohesive(incoming, members, 60, quorum=0.6))
+
+    def test_conflict_with_any_member_vetoes(self):
+        incoming = self._ds(bd=['1882-02-23'])
+        members = [self._ds(bd=['1882-02-23']) for _ in range(3)]
+        members.append(self._ds(sn='Lowenstein'))  # surname conflict
+        self.assertFalse(cluster_is_cohesive(incoming, members, 60, quorum=0.6))
+
+    def test_minority_agreement_fails_the_quorum(self):
+        # Coheres with ONE of three; the other two carry clearly different (but not
+        # conflicting) dates — indeterminate — so the record agrees with a minority.
+        incoming = self._ds(bd=['1882-02-23'], bp=['Przemysl'])
+        members = [self._ds(bd=['1882-02-23'], bp=['Przemysl']),
+                   self._ds(bd=['1899-11-05']), self._ds(bd=['1905-03-14'])]
+        self.assertFalse(cluster_is_cohesive(incoming, members, 60, quorum=0.6))
+
+    def test_empty_cluster_coheres(self):
+        self.assertTrue(cluster_is_cohesive(self._ds(), [], 60))
+
+    def test_two_member_cluster_needs_full_agreement(self):
+        # ceil(2 * 0.6) == 2 → both members must cohere (strict for small clusters).
+        incoming = self._ds(bd=['1882-02-23'])
+        members = [self._ds(bd=['1882-02-23']), self._ds(bd=['1899-11-05'])]
+        self.assertFalse(cluster_is_cohesive(incoming, members, 60, quorum=0.6))
 
 
 def _cids(birth, rt=1):
